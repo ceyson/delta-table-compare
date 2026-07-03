@@ -1,0 +1,14 @@
+# Core
+pyarrow>=14.0
+
+# Spark engine
+pyspark[sql]>=3.5.2
+delta-spark==3.2.0
+
+# Polars engine
+polars>=1.0
+deltalake>=0.18
+
+# Testing
+pytest>=7.0
+pytest-timeout>=2.2

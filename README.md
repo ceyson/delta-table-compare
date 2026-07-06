@@ -19,9 +19,18 @@ The `recon` package compares two versioned datasets (left vs. right) at the quar
 | Engine | Environment | Best For |
 |--------|-------------|----------|
 | **PySpark** | Databricks (distributed) | Production runs on large clusters |
-| **Polars** | Local Linux / CI | Fast iteration, testing, single-node analysis |
+| **Polars** | Local / CI / Databricks (single-node) | Fast iteration, testing, driver-node analysis |
 
 Both engines produce identical output schemas and Delta table artifacts.
+
+### Polars on Databricks
+
+The Polars engine runs on Databricks clusters using a hybrid I/O strategy:
+- **Compute**: Pure Polars (hashes, joins, aggregations) — single-node, vectorized.
+- **Reads**: `spark.table()` → Arrow → Polars (avoids Azure credential issues with delta-rs).
+- **Writes**: Polars → Pandas → `spark.createDataFrame()` → Delta `saveAsTable()`.
+
+This is auto-detected via `DATABRICKS_RUNTIME_VERSION` — no code changes needed.
 
 ## Quick Start
 
@@ -69,6 +78,27 @@ engine = get_engine("polars")
 # See docs/spec.md for full phase-by-phase usage
 ```
 
+### Databricks (Polars engine)
+
+```python
+# Same as PySpark example but with engine="polars".
+# Polars handles compute; Spark handles Delta I/O automatically.
+cfg = ReconcileConfig(
+    left_table_name="catalog.schema.left_table",
+    right_table_name="catalog.schema.right_table",
+    output_catalog="catalog",
+    output_schema="recon_schema",
+    key_cols=["policy_id", "quarter_date"],
+    qtr_col="quarter_date",
+    critical_cols=["revenue", "premium"],
+    engine="polars",
+)
+
+engine = get_engine("polars")
+engine.setup(cfg)
+# Reads/writes route through Spark automatically on Databricks
+```
+
 ## Package Structure
 
 ```
@@ -83,10 +113,13 @@ spark_reconciliation/
 │       ├── __init__.py      Engine registry
 │       └── polars_engine.py Polars implementation of all phases
 ├── benchmarks/
-│   └── bench_runner.py      Scaling + change-rate benchmark grid
+│   ├── bench_runner.py      Scaling + change-rate benchmark grid (local)
+│   ├── databricks_benchmark.py       Production benchmark module (Databricks)
+│   └── databricks_benchmark_notebook.py  Notebook scaffold (import to Workspace)
 ├── tests/
-│   ├── conftest.py          Shared fixtures (SparkSession, paths)
-│   ├── data_generator.py    Synthetic test data with injected differences
+│   ├── conftest.py          Shared fixtures (env-aware, auto-skip markers)
+│   ├── data_generator.py    Synthetic test data (Spark-based)
+│   ├── polars_data_generator.py  Synthetic test data (Polars-native, no Spark)
 │   └── test_recon/          Unit and integration tests
 ├── docs/
 │   ├── architecture.md      Design and data flow
@@ -95,7 +128,9 @@ spark_reconciliation/
 │   ├── interpretation_guide.md  How to read results
 │   └── benchmarks.md        Performance data and projections
 ├── requirements-dev.txt     Development dependencies
-├── setup_env.sh             Environment setup script
+├── setup_env.sh             Environment setup (Linux/macOS)
+├── setup_env.ps1            Environment setup (Windows PowerShell)
+├── setup_env.py             Environment setup (cross-platform Python)
 └── README.md                This file
 ```
 
@@ -133,18 +168,69 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full phase breakdown, projectio
 
 ## Development
 
+### Linux / macOS
+
 ```bash
-# Setup virtual environment
-bash setup_env.sh
-
-# Activate
+python setup_env.py            # or: source setup_env.sh
 source .venv/bin/activate
-
-# Run tests
 pytest tests/ -v --timeout=120
+```
 
-# Run benchmarks (tiny → typical, both engines)
+### Windows (PowerShell / VSCode)
+
+```powershell
+python setup_env.py --polars    # or: .\setup_env.ps1 -Polars
+.venv\Scripts\activate
+pytest tests/ -m "not spark" -v
+```
+
+> **Note**: Use `--polars` to skip PySpark/Java dependencies on Windows.
+> Spark-marked tests are automatically skipped when PySpark is unavailable.
+
+### Test Markers
+
+| Marker | Meaning |
+|--------|---------|
+| `@pytest.mark.spark` | Requires PySpark + Delta |
+| `@pytest.mark.polars` | Requires Polars + deltalake |
+| *(none)* | Pure Python, runs everywhere |
+
+```bash
+pytest tests/ -m "not spark"   # Windows / Polars-only
+pytest tests/ -m "not polars"  # Spark-only
+pytest tests/                  # All (requires both)
+```
+
+### Benchmarks (local)
+
+```bash
 python benchmarks/bench_runner.py --engine both --max-scale typical
+```
+
+### Benchmarks (Databricks)
+
+Import `benchmarks/databricks_benchmark_notebook.py` into your Databricks Workspace,
+edit the configuration cell, and run all cells. Produces:
+- Summary comparison table (Polars vs Spark)
+- Per-phase breakdown with % of total
+- Linear scaling projection to max workload
+- Seaborn line plot (scaling) + bar chart (phase breakdown)
+
+Or call the module directly from any notebook:
+
+```python
+from benchmarks.databricks_benchmark import run_benchmark_grid, report_results
+
+results = run_benchmark_grid(
+    source_table="catalog.schema.table",
+    output_catalog="catalog",
+    output_schema="recon_benchmarks",
+    qtr_col="quarter_date",
+    key_cols=["policy_id", "quarter_date"],
+    quarter_grid=[4, 8, 12, 20],
+    engines=["polars", "spark"],
+)
+report_results(results, max_scale_rows=4_000_000)
 ```
 
 ## Documentation
@@ -159,5 +245,7 @@ python benchmarks/bench_runner.py --engine both --max-scale typical
 
 - **Python**: >= 3.10
 - **PySpark engine**: PySpark >= 3.4, delta-spark (bundled on Databricks)
-- **Polars engine**: polars >= 1.0, deltalake >= 0.18
-- **Testing**: pytest >= 7.0, pyspark (local SparkSession with Delta)
+- **Polars engine (local)**: polars >= 1.0, deltalake >= 0.18
+- **Polars engine (Databricks)**: polars >= 1.0 (deltalake not required — I/O via Spark)
+- **Testing (full)**: pytest >= 7.0, pyspark, polars, deltalake
+- **Testing (Polars-only)**: pytest >= 7.0, polars, deltalake (no Java/PySpark needed)

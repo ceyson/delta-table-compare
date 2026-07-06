@@ -21,41 +21,76 @@ from .base import ReconEngine
 
 try:
     import polars as pl
-    from deltalake import DeltaTable, write_deltalake
 except ImportError as e:
     raise ImportError(
-        "Polars engine requires 'polars' and 'deltalake' packages. "
+        "Polars engine requires the 'polars' package. "
         "Install with: pip install 'recon[polars]'"
     ) from e
 
+try:
+    from deltalake import DeltaTable, write_deltalake
+    _HAS_DELTALAKE = True
+except ImportError:
+    _HAS_DELTALAKE = False
 
-def _resolve_table_path(table_name: str) -> str:
-    """Resolve a table name to a path.
 
-    If the table_name looks like a file path (contains / or \\), use it directly.
-    Otherwise, treat it as a Delta table reference.
-    """
-    if "/" in table_name or "\\" in table_name:
-        return table_name
-    return table_name
+# ---------------------------------------------------------------------------
+# Environment detection
+# ---------------------------------------------------------------------------
 
+def _is_databricks() -> bool:
+    """Detect if running inside a Databricks cluster."""
+    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+
+
+def _is_path(table_name: str) -> bool:
+    """Return True if *table_name* looks like a filesystem path."""
+    return "/" in table_name or "\\" in table_name
+
+
+# ---------------------------------------------------------------------------
+# Read helpers
+# ---------------------------------------------------------------------------
 
 def _read_delta(table_name: str) -> pl.LazyFrame:
-    """Read a Delta table as a Polars LazyFrame."""
-    path = _resolve_table_path(table_name)
-    return pl.scan_delta(path)
+    """Read a Delta table as a Polars LazyFrame.
 
+    - **Local**: uses ``pl.scan_delta(path)``.
+    - **Databricks**: reads via Spark, converts Arrow → Polars lazy.
+    """
+    if _is_databricks():
+        return _read_delta_via_spark(table_name)
+    if not _HAS_DELTALAKE:
+        raise ImportError(
+            "The 'deltalake' package is required for local Delta reads. "
+            "Install with: pip install 'recon[polars]'"
+        )
+    return pl.scan_delta(table_name)
+
+
+def _read_delta_via_spark(table_name: str) -> pl.LazyFrame:
+    """Read a Delta table through Spark and return a Polars LazyFrame."""
+    from ..helpers import get_spark
+    spark = get_spark()
+    if _is_path(table_name):
+        sdf = spark.read.format("delta").load(table_name)
+    else:
+        sdf = spark.table(table_name)
+    arrow_table = sdf.toPandas()  # Spark → Pandas (Arrow-optimised)
+    return pl.from_pandas(arrow_table).lazy()
+
+
+# ---------------------------------------------------------------------------
+# Write helpers
+# ---------------------------------------------------------------------------
 
 def _write_delta_append(df: pl.DataFrame, table_path: str) -> None:
     """Append a Polars DataFrame to a Delta table."""
     t0 = _time.perf_counter()
-    path = _resolve_table_path(table_path)
-    arrow_table = df.to_arrow()
-    if os.path.exists(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, "_delta_log")):
-        write_deltalake(path, arrow_table, mode="append", schema_mode="merge")
+    if _is_databricks():
+        _write_via_spark(df, table_path, mode="append")
     else:
-        os.makedirs(path, exist_ok=True)
-        write_deltalake(path, arrow_table, mode="overwrite")
+        _write_local(df, table_path, mode="append")
     elapsed = _time.perf_counter() - t0
     get_write_timings().record(table_path, "append", elapsed, row_count=df.height)
 
@@ -63,12 +98,45 @@ def _write_delta_append(df: pl.DataFrame, table_path: str) -> None:
 def _overwrite_delta(df: pl.DataFrame, table_path: str) -> None:
     """Overwrite a Delta table with a Polars DataFrame."""
     t0 = _time.perf_counter()
-    path = _resolve_table_path(table_path)
-    arrow_table = df.to_arrow()
-    os.makedirs(path, exist_ok=True)
-    write_deltalake(path, arrow_table, mode="overwrite", schema_mode="overwrite")
+    if _is_databricks():
+        _write_via_spark(df, table_path, mode="overwrite")
+    else:
+        _write_local(df, table_path, mode="overwrite")
     elapsed = _time.perf_counter() - t0
     get_write_timings().record(table_path, "overwrite", elapsed, row_count=df.height)
+
+
+def _write_via_spark(df: pl.DataFrame, table_name: str, mode: str) -> None:
+    """Write a Polars DataFrame to Delta via Spark (Databricks path)."""
+    from ..helpers import get_spark
+    spark = get_spark()
+    spark_df = spark.createDataFrame(df.to_pandas())
+    writer = spark_df.write.format("delta").mode(mode)
+    if mode == "overwrite":
+        writer = writer.option("overwriteSchema", "true")
+    if _is_path(table_name):
+        writer.save(table_name)
+    else:
+        writer.option("mergeSchema", "true").saveAsTable(table_name)
+
+
+def _write_local(df: pl.DataFrame, table_path: str, mode: str) -> None:
+    """Write a Polars DataFrame to a local Delta table via deltalake."""
+    if not _HAS_DELTALAKE:
+        raise ImportError(
+            "The 'deltalake' package is required for local Delta writes. "
+            "Install with: pip install 'recon[polars]'"
+        )
+    arrow_table = df.to_arrow()
+    if mode == "append":
+        if os.path.exists(table_path) and os.path.isdir(table_path) and os.path.exists(os.path.join(table_path, "_delta_log")):
+            write_deltalake(table_path, arrow_table, mode="append", schema_mode="merge")
+        else:
+            os.makedirs(table_path, exist_ok=True)
+            write_deltalake(table_path, arrow_table, mode="overwrite")
+    else:
+        os.makedirs(table_path, exist_ok=True)
+        write_deltalake(table_path, arrow_table, mode="overwrite", schema_mode="overwrite")
 
 
 def _hash_row_cols(df: pl.LazyFrame, cols: list[str], hash_name: str) -> pl.Expr:
@@ -82,25 +150,36 @@ def _hash_row_cols(df: pl.LazyFrame, cols: list[str], hash_name: str) -> pl.Expr
     return concat_expr.hash().alias(hash_name)
 
 
-def _table_path(cfg: ReconcileConfig, logical_name: str) -> str:
-    """Build output path for a final artifact table."""
-    base = cfg.output_schema  # For polars, output_schema is a directory path
-    return os.path.join(base, f"{cfg.final_prefix}_{logical_name}")
+def _table_ref(cfg: ReconcileConfig, logical_name: str) -> str:
+    """Build a table reference for a final artifact table.
+
+    - **Local**: returns a filesystem path.
+    - **Databricks**: returns a fully-qualified UC table name.
+    """
+    table_leaf = f"{cfg.final_prefix}_{logical_name}"
+    if _is_databricks():
+        from ..helpers import table_fqn
+        return table_fqn(cfg.output_catalog, cfg.output_schema, table_leaf)
+    return os.path.join(cfg.output_schema, table_leaf)
 
 
-def _tmp_path(cfg: ReconcileConfig, logical_name: str) -> str:
-    """Build output path for a temp table."""
-    base = cfg.output_schema
+def _tmp_ref(cfg: ReconcileConfig, logical_name: str) -> str:
+    """Build a table reference for a temporary intermediate table."""
     safe_run = cfg.run_id.replace("-", "_").replace(":", "_").replace(" ", "_")
-    return os.path.join(base, f"{cfg.temp_prefix}_{logical_name}_{safe_run}")
+    table_leaf = f"{cfg.temp_prefix}_{logical_name}_{safe_run}"
+    if _is_databricks():
+        from ..helpers import table_fqn
+        return table_fqn(cfg.output_catalog, cfg.output_schema, table_leaf)
+    return os.path.join(cfg.output_schema, table_leaf)
 
 
 class PolarsEngine(ReconEngine):
     """Polars + delta-rs reconciliation engine."""
 
     def setup(self, cfg: ReconcileConfig) -> None:
-        """Ensure output directory exists."""
-        os.makedirs(cfg.output_schema, exist_ok=True)
+        """Prepare the output location."""
+        if not _is_databricks():
+            os.makedirs(cfg.output_schema, exist_ok=True)
 
     def validate_tables(self, cfg: ReconcileConfig) -> None:
         """Verify source tables exist and required columns are present."""
@@ -190,7 +269,7 @@ class PolarsEngine(ReconEngine):
             "left_checksum", "right_checksum",
             "left_row_count", "right_row_count", "quarter_status",
         )
-        _write_delta_append(artifact, _table_path(cfg, "quarter_checksums"))
+        _write_delta_append(artifact, _table_ref(cfg, "quarter_checksums"))
 
         # Extract changed quarters
         changed_quarters = (
@@ -282,7 +361,7 @@ class PolarsEngine(ReconEngine):
             .group_by("run_id", "source_label", cfg.qtr_col, "row_status")
             .agg(pl.len().alias("row_count"))
         )
-        _write_delta_append(row_status_counts, _table_path(cfg, "row_status_counts"))
+        _write_delta_append(row_status_counts, _table_ref(cfg, "row_status_counts"))
 
         # Total matched per quarter
         total_matched_per_qtr = (
@@ -544,12 +623,12 @@ class PolarsEngine(ReconEngine):
             # Write summary
             if summary_rows:
                 summary_df = pl.DataFrame(summary_rows)
-                _write_delta_append(summary_df, _table_path(cfg, "column_summary_by_quarter"))
+                _write_delta_append(summary_df, _table_ref(cfg, "column_summary_by_quarter"))
 
             # Write mismatch samples
             if mismatch_rows:
                 mm_df = pl.DataFrame(mismatch_rows)
-                _write_delta_append(mm_df, _table_path(cfg, "mismatch_sample"))
+                _write_delta_append(mm_df, _table_ref(cfg, "mismatch_sample"))
 
             batch_count += 1
 
@@ -598,69 +677,85 @@ class PolarsEngine(ReconEngine):
                         "null_mismatch_pct": 0.0,
                     })
             if zero_rows:
-                _write_delta_append(pl.DataFrame(zero_rows), _table_path(cfg, "column_summary_by_quarter"))
+                _write_delta_append(pl.DataFrame(zero_rows), _table_ref(cfg, "column_summary_by_quarter"))
 
         # Build all-quarter rollups
-        summary_path = _table_path(cfg, "column_summary_by_quarter")
-        if os.path.exists(summary_path) and os.path.exists(os.path.join(summary_path, "_delta_log")):
-            summary = pl.scan_delta(summary_path).filter(
+        summary_ref = _table_ref(cfg, "column_summary_by_quarter")
+        try:
+            summary = _read_delta(summary_ref).filter(
                 pl.col("run_id") == cfg.run_id
             ).collect()
+        except Exception:
+            summary = pl.DataFrame()
 
-            if summary.height > 0:
-                rollup = (
-                    summary
-                    .group_by("run_id", "source_label", "column")
-                    .agg(
-                        pl.col("matched_row_count").sum().alias("matched_row_count"),
-                        pl.col("nonnull_compared_count").sum().alias("nonnull_compared_count"),
-                        pl.col("mismatch_count").sum().alias("mismatch_count"),
-                        pl.col("null_mismatch_count").sum().alias("null_mismatch_count"),
-                        pl.col("max_abs_diff").max().alias("max_abs_diff"),
-                    )
-                    .with_columns(
-                        pl.when(pl.col("matched_row_count") > 0)
-                        .then(pl.col("mismatch_count") / pl.col("matched_row_count"))
-                        .otherwise(None)
-                        .alias("mismatch_pct"),
-                        pl.when(pl.col("matched_row_count") > 0)
-                        .then(pl.col("null_mismatch_count") / pl.col("matched_row_count"))
-                        .otherwise(None)
-                        .alias("null_mismatch_pct"),
-                    )
+        if summary.height > 0:
+            rollup = (
+                summary
+                .group_by("run_id", "source_label", "column")
+                .agg(
+                    pl.col("matched_row_count").sum().alias("matched_row_count"),
+                    pl.col("nonnull_compared_count").sum().alias("nonnull_compared_count"),
+                    pl.col("mismatch_count").sum().alias("mismatch_count"),
+                    pl.col("null_mismatch_count").sum().alias("null_mismatch_count"),
+                    pl.col("max_abs_diff").max().alias("max_abs_diff"),
                 )
-                _write_delta_append(rollup, _table_path(cfg, "column_summary_all_quarters"))
+                .with_columns(
+                    pl.when(pl.col("matched_row_count") > 0)
+                    .then(pl.col("mismatch_count") / pl.col("matched_row_count"))
+                    .otherwise(None)
+                    .alias("mismatch_pct"),
+                    pl.when(pl.col("matched_row_count") > 0)
+                    .then(pl.col("null_mismatch_count") / pl.col("matched_row_count"))
+                    .otherwise(None)
+                    .alias("null_mismatch_pct"),
+                )
+            )
+            _write_delta_append(rollup, _table_ref(cfg, "column_summary_all_quarters"))
 
-                # Noisy column detection
-                noisy = rollup.filter(
-                    (pl.col("matched_row_count") > 0)
-                    & (pl.col("mismatch_pct") >= cfg.noisy_column_threshold)
-                ).with_columns(pl.lit("change_rate_above_threshold").alias("suspected_reason"))
+            # Noisy column detection
+            noisy = rollup.filter(
+                (pl.col("matched_row_count") > 0)
+                & (pl.col("mismatch_pct") >= cfg.noisy_column_threshold)
+            ).with_columns(pl.lit("change_rate_above_threshold").alias("suspected_reason"))
 
-                if noisy.height > 0:
-                    _write_delta_append(
-                        noisy.select("run_id", "source_label", "column", "matched_row_count",
-                                     "mismatch_count", "mismatch_pct", "suspected_reason"),
-                        _table_path(cfg, "noisy_columns"),
-                    )
-                    print(f"Phase 5: {noisy.height} columns flagged as noisy.")
-                else:
-                    print("Phase 5: No noisy columns detected.")
+            if noisy.height > 0:
+                _write_delta_append(
+                    noisy.select("run_id", "source_label", "column", "matched_row_count",
+                                 "mismatch_count", "mismatch_pct", "suspected_reason"),
+                    _table_ref(cfg, "noisy_columns"),
+                )
+                print(f"Phase 5: {noisy.height} columns flagged as noisy.")
+            else:
+                print("Phase 5: No noisy columns detected.")
 
         print("Phase 5: Rollups complete.")
 
     def cleanup(self, cfg: ReconcileConfig) -> None:
-        """Remove temp directories."""
-        import shutil
-        base = cfg.output_schema
-        safe_run = cfg.run_id.replace("-", "_").replace(":", "_").replace(" ", "_")
-        prefix = f"{cfg.temp_prefix}_"
-
-        if os.path.isdir(base):
-            for entry in os.listdir(base):
-                if entry.startswith(prefix) and safe_run in entry:
-                    path = os.path.join(base, entry)
-                    shutil.rmtree(path, ignore_errors=True)
+        """Remove temp tables / directories."""
+        if _is_databricks():
+            from ..helpers import get_spark
+            spark = get_spark()
+            safe_run = cfg.run_id.replace("-", "_").replace(":", "_").replace(" ", "_")
+            prefix = f"{cfg.temp_prefix}_"
+            try:
+                tables = spark.sql(
+                    f"SHOW TABLES IN `{cfg.output_catalog}`.`{cfg.output_schema}` LIKE '{prefix}*{safe_run}'"
+                ).collect()
+                for row in tables:
+                    tname = row["tableName"]
+                    spark.sql(f"DROP TABLE IF EXISTS `{cfg.output_catalog}`.`{cfg.output_schema}`.`{tname}`")
+            except Exception as exc:
+                print(f"WARNING: Cleanup failed: {exc}")
+        else:
+            import shutil
+            base = cfg.output_schema
+            safe_run = cfg.run_id.replace("-", "_").replace(":", "_").replace(" ", "_")
+            prefix = f"{cfg.temp_prefix}_"
+            if os.path.isdir(base):
+                for entry in os.listdir(base):
+                    if entry.startswith(prefix) and safe_run in entry:
+                        path = os.path.join(base, entry)
+                        shutil.rmtree(path, ignore_errors=True)
 
         print("Cleanup: Temp tables removed.")
 
@@ -683,7 +778,7 @@ class PolarsEngine(ReconEngine):
             "completed_at": None,
             "status": "RUNNING",
         }])
-        _write_delta_append(meta, _table_path(cfg, "run_metadata"))
+        _write_delta_append(meta, _table_ref(cfg, "run_metadata"))
 
     def mark_run_complete(self, cfg: ReconcileConfig, status: str) -> None:
         """Update run metadata with final status."""
@@ -705,6 +800,6 @@ class PolarsEngine(ReconEngine):
             "status": status,
         }])
         try:
-            _write_delta_append(meta, _table_path(cfg, "run_metadata"))
+            _write_delta_append(meta, _table_ref(cfg, "run_metadata"))
         except Exception as exc:
             print(f"WARNING: Could not update run_metadata: {exc}")

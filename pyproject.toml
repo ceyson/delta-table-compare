@@ -39,3 +39,7 @@ include = ["recon*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 300
+markers = [
+    "spark: tests requiring PySpark + Delta (skipped when pyspark is unavailable)",
+    "polars: tests requiring Polars + deltalake (skipped when polars is unavailable)",
+]

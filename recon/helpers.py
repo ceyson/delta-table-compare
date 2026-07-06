@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import time as _time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Sequence, TYPE_CHECKING
 
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
 
 from .config import ReconcileConfig
 
@@ -24,6 +25,8 @@ def get_spark() -> SparkSession:
     When running locally with Delta, configures the session with the
     delta-spark extensions automatically.
     """
+    from pyspark.sql import SparkSession
+
     global _spark_session
 
     if _spark_session is not None:
@@ -177,12 +180,13 @@ def safe_suffix(value: str) -> str:
 def colq(name: str) -> F.Column:
     """Return a Spark Column reference with backtick-quoted name.
 
-    Args:
+    Args (lazy import: pyspark.sql.functions):
         name: Column name to reference.
 
     Returns:
         ``pyspark.sql.Column`` referencing the quoted column name.
     """
+    from pyspark.sql import functions as F
     return F.col(quote_name(name))
 
 
@@ -341,7 +345,7 @@ def _get_table_location(full_table_name: str) -> str:
     return f"{warehouse}/{schema}.db/{table}"
 
 
-def write_delta_append(df: DataFrame, full_table_name: str) -> None:
+def write_delta_append(df: DataFrame, full_table_name: str) -> None:  # noqa: F811
     """Append rows to a Delta table, creating it if needed.
 
     Schema evolution (``mergeSchema``) is enabled so new columns are
@@ -381,7 +385,7 @@ def write_delta_append(df: DataFrame, full_table_name: str) -> None:
     _write_timings.record(full_table_name, "append", elapsed)
 
 
-def overwrite_delta_table(df: DataFrame, full_table_name: str) -> None:
+def overwrite_delta_table(df: DataFrame, full_table_name: str) -> None:  # noqa: F811
     """Overwrite a Delta table with new data and schema.
 
     Replaces both data and schema entirely.  Used for temporary
@@ -424,12 +428,13 @@ def overwrite_delta_table(df: DataFrame, full_table_name: str) -> None:
 def is_numeric_type(dt: T.DataType) -> bool:
     """Check whether a Spark DataType is numeric.
 
-    Args:
+    Args (lazy import: pyspark.sql.types):
         dt: A ``pyspark.sql.types.DataType`` instance.
 
     Returns:
         True if *dt* is one of Byte, Short, Int, Long, Float, Double, or Decimal.
     """
+    from pyspark.sql import types as T
     return isinstance(
         dt,
         (
@@ -444,7 +449,7 @@ def is_numeric_type(dt: T.DataType) -> bool:
     )
 
 
-def get_schema_map(table_name: str) -> dict[str, T.DataType]:
+def get_schema_map(table_name: str) -> dict[str, T.DataType]:  # noqa: F811
     """Return a mapping of column name to DataType for a table.
 
     Args:
@@ -535,6 +540,8 @@ def normalize_for_hash(
 ) -> F.Column:
     """Normalize a column value to a deterministic string for hashing.
 
+    Requires PySpark at runtime.
+
     Applies type-specific transformations (trimming, lowering, rounding,
     date formatting) and replaces NULLs with a sentinel so that
     xxhash64 never receives a null input.
@@ -547,6 +554,9 @@ def normalize_for_hash(
     Returns:
         A Spark Column expression producing a non-null string.
     """
+    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
+
     sentinel = F.lit("__NULL__")
 
     if isinstance(data_type, T.StringType):

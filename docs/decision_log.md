@@ -134,3 +134,49 @@ Chronological record of key architectural and implementation decisions.
 **Validation**: The measured data shows near-linear scaling for Polars compute phases. Spark has a large fixed overhead (~25s) that dominates at small scales, with linear growth beyond that.
 
 **Caveat**: Projections assume single-node execution and no memory pressure. At 4M × 5K, memory requirements (~150 GB for a full join) may require streaming or partitioned processing.
+
+---
+
+## D-010: Polars hybrid I/O on Databricks (Spark-delegated reads/writes)
+
+**Date**: 2025-07  
+**Context**: The `deltalake` (delta-rs) Python library cannot authenticate to Azure storage on Databricks clusters due to credential passthrough limitations (`OSError: Kernel error -> Generic Microsoft Azure error`). This blocks the Polars engine from running on Databricks.
+
+**Decision**: On Databricks, route all Delta I/O through the cluster's Spark runtime:
+- **Reads**: `spark.table(name)` -> `.toPandas()` -> `pl.from_pandas().lazy()`
+- **Writes**: `df.to_pandas()` -> `spark.createDataFrame()` -> `.write.format("delta").saveAsTable()`
+- **Detection**: Auto-detected via `DATABRICKS_RUNTIME_VERSION` env var.
+- **Local mode**: Unchanged -- still uses `deltalake` directly for zero-dependency simplicity.
+
+**Rationale**:
+- Spark on Databricks already has authenticated access to Unity Catalog storage.
+- Arrow-backed `.toPandas()` is near zero-copy for most types.
+- No additional credentials or config required from the user.
+- `deltalake` becomes optional on Databricks (only `polars` is required).
+
+**Trade-offs**: 
+- Read path adds Spark -> Pandas -> Polars overhead (~2s per table at typical scale).
+- Write path adds Polars -> Pandas -> Spark overhead.
+- Acceptable given the alternative is non-functional.
+
+---
+
+## D-011: Cross-platform test infrastructure with pytest markers
+
+**Date**: 2025-07  
+**Context**: The test suite required PySpark for all tests, including Polars engine tests (because the data generator used Spark). This prevented development and testing on Windows where JVM/PySpark installation is difficult.
+
+**Decision**:
+1. Register `@pytest.mark.spark` and `@pytest.mark.polars` markers.
+2. `conftest.py` auto-skips tests whose marker dependencies are unavailable.
+3. Create a Polars-native data generator (`polars_data_generator.py`) -- no Spark needed.
+4. Make `recon.helpers` importable without PySpark (lazy imports via `TYPE_CHECKING`).
+5. Provide cross-platform setup scripts (`setup_env.py`, `setup_env.ps1`).
+
+**Rationale**:
+- Windows developers can run `pytest -m "not spark"` with Polars-only dependencies.
+- Databricks notebooks can run `pytest` with the cluster's existing SparkSession.
+- CI can run the full suite on Linux with both engines.
+- No test is silently broken -- markers make skip reasons explicit.
+
+**Trade-offs**: Two data generators to maintain. Mitigated by keeping both simple and schema-compatible.

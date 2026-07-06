@@ -2,18 +2,22 @@
 Functional tests for the Polars reconciliation engine.
 
 Tests run against local Delta tables using Polars + deltalake.
+No PySpark dependency — uses the Polars-native data generator.
 """
 
 from __future__ import annotations
 
 import os
-import tempfile
 from datetime import date
 
 import pytest
 
+pytestmark = pytest.mark.polars
+
 polars = pytest.importorskip("polars", reason="Polars not installed")
 deltalake = pytest.importorskip("deltalake", reason="deltalake not installed")
+
+import polars as pl
 
 from recon.config import ReconcileConfig
 from recon.engines import get_engine
@@ -21,17 +25,15 @@ from recon.helpers import build_column_groups
 
 
 @pytest.fixture(scope="module")
-def polars_test_env(local_spark, tmp_path_factory):
-    """Generate test data using Spark, then test with Polars engine."""
-    from tests.data_generator import generate_test_data, inject_differences
+def polars_test_env(tmp_path_factory):
+    """Generate test data using the Polars-native data generator."""
+    from tests.polars_data_generator import generate_test_data
 
-    spark = local_spark
     base_dir = str(tmp_path_factory.mktemp("polars_functional"))
     output_dir = os.path.join(base_dir, "polars_output")
     os.makedirs(output_dir, exist_ok=True)
 
     left_path, right_path, critical_cols = generate_test_data(
-        spark=spark,
         output_path=base_dir,
         n_quarters=3,
         base_rows_per_quarter=1000,
@@ -49,7 +51,6 @@ def polars_test_env(local_spark, tmp_path_factory):
         "left_path": left_path,
         "right_path": right_path,
         "critical_cols": critical_cols,
-        "spark": spark,
     }
 
 
@@ -91,7 +92,6 @@ class TestPolarsIdentical:
         assert len(changed_quarters) == 0
 
         # All quarters should be identical
-        import polars as pl
         identical_count = quarter_status.filter(pl.col("quarter_status") == "identical").height
         assert identical_count == 3
 
@@ -100,7 +100,7 @@ class TestPolarsWithDifferences:
     """Polars engine: detect injected differences."""
 
     def test_value_changes(self, polars_test_env):
-        from tests.data_generator import inject_differences
+        from tests.polars_data_generator import inject_differences
 
         env = polars_test_env
         output_dir = os.path.join(env["output_dir"], "changes")
@@ -110,7 +110,6 @@ class TestPolarsWithDifferences:
         critical_cols = env["critical_cols"]
         target_cols = critical_cols[:3]
         modified_path = inject_differences(
-            spark=env["spark"],
             source_path=env["left_path"],
             output_path=os.path.join(env["base_dir"], "polars_right_modified"),
             change_rate=0.10,
@@ -172,7 +171,6 @@ class TestPolarsWithDifferences:
         engine.mark_run_complete(cfg, "COMPLETED")
 
         # Verify summary artifact was written
-        import polars as pl
         summary_path = os.path.join(output_dir, "recon_column_summary_by_quarter")
         assert os.path.exists(summary_path)
 

@@ -89,11 +89,19 @@ class ReconEngine:
 
 ### Polars Engine
 
-- Uses `polars.DataFrame` and `polars.LazyFrame`.
-- Reads Delta tables via `polars.scan_delta()` (lazy) / `polars.read_delta()`.
-- Writes via `deltalake.write_deltalake()`.
+- Uses `polars.DataFrame` and `polars.LazyFrame` for all compute.
 - Hash computation uses Polars' built-in `hash()` with `reinterpret(signed=True)` for consistent i64 representation.
 - All operations are vectorized — no Python-level row iteration.
+- **I/O adapts to environment** (auto-detected via `DATABRICKS_RUNTIME_VERSION`):
+
+| Operation | Local | Databricks |
+|-----------|-------|------------|
+| Read | `pl.scan_delta(path)` via deltalake | `spark.table()` → `.toPandas()` → `pl.from_pandas().lazy()` |
+| Write | `write_deltalake(path, ...)` via deltalake | `df.to_pandas()` → `spark.createDataFrame()` → `.saveAsTable()` |
+| Table refs | Filesystem paths | Unity Catalog FQN (`catalog.schema.table`) |
+| Cleanup | `shutil.rmtree()` temp dirs | `DROP TABLE IF EXISTS` via Spark SQL |
+
+This hybrid approach leverages Polars' vectorized compute speed while delegating credential-authenticated storage access to the Spark runtime on Databricks.
 
 ## Column Grouping Strategy
 
@@ -127,9 +135,12 @@ This enables separation of compute time from I/O time in benchmarks, which is cr
 | Aspect | Local | Databricks |
 |--------|-------|------------|
 | Spark catalog | `spark-warehouse/` path-based | Unity Catalog |
-| Delta writes | Path-mode with `CREATE TABLE USING DELTA LOCATION` | Managed tables |
+| Delta writes (Spark engine) | Path-mode + `CREATE TABLE USING DELTA LOCATION` | Managed tables via `saveAsTable` |
+| Delta writes (Polars engine) | `deltalake` library (delta-rs) | Polars → Pandas → Spark → `saveAsTable` |
+| Delta reads (Polars engine) | `pl.scan_delta()` (delta-rs) | `spark.table()` → Arrow → Polars |
 | File I/O | Direct filesystem | No DBFS write access |
 | Parallelism | Single-node, limited cores | Multi-node cluster |
 | Benchmark output | Delta tables + CSV/JSON | Delta tables only |
+| Credentials | N/A (local files) | Handled by Spark runtime (AAD/MSI) |
 
-The `_is_databricks()` helper in `helpers.py` detects the environment and adapts write strategies accordingly.
+The `_is_databricks()` helper (present in both `helpers.py` and `polars_engine.py`) detects the environment and adapts I/O strategies accordingly.

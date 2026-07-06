@@ -1,11 +1,14 @@
 """
 Unit tests for recon.helpers — pure-logic utilities that don't require Spark.
 
-Note: helpers.py imports pyspark at module level, so these tests will be skipped
-in environments without pyspark installed. They run on Databricks or CI with pyspark.
+Note: helpers.py imports pyspark at module level, so these tests require
+pyspark to be installed.  They are marked ``@pytest.mark.spark`` and will
+be auto-skipped in environments without pyspark.
 """
 
 import pytest
+
+pytestmark = pytest.mark.spark
 
 pyspark = pytest.importorskip("pyspark", reason="PySpark not installed")
 

@@ -13,6 +13,8 @@ from datetime import date
 
 import pytest
 
+pytestmark = pytest.mark.spark
+
 pyspark = pytest.importorskip("pyspark", reason="PySpark not installed")
 
 from pyspark.sql import SparkSession

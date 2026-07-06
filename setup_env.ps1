@@ -23,20 +23,20 @@ if (-Not (Test-Path $VenvDir)) {
 
 # Upgrade pip
 Write-Host "`nUpgrading pip..." -ForegroundColor Cyan
-& $VenvPip install --upgrade pip setuptools wheel -q
+& $VenvPython -m pip install --upgrade pip setuptools wheel -q
 
 if ($Polars) {
     Write-Host "`nInstalling Polars-only dependencies (no PySpark)..." -ForegroundColor Cyan
-    & $VenvPip install "pyarrow>=14.0" "polars>=1.0" "deltalake>=0.18" "pytest>=7.0" "pytest-timeout>=2.2" -q
+    & $VenvPython -m pip install "pyarrow>=14.0" "polars>=1.0" "deltalake>=0.18" "pytest>=7.0" "pytest-timeout>=2.2" -q
 } else {
     $ReqFile = Join-Path $ScriptDir "requirements-dev.txt"
     Write-Host "`nInstalling all dependencies from requirements-dev.txt..." -ForegroundColor Cyan
-    & $VenvPip install -r $ReqFile -q
+    & $VenvPython -m pip install -r $ReqFile -q
 }
 
 # Install project editable
 Write-Host "`nInstalling recon package (editable)..." -ForegroundColor Cyan
-& $VenvPip install -e $ScriptDir -q
+& $VenvPython -m pip install -e $ScriptDir -q
 
 # Instructions
 Write-Host ""

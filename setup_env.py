@@ -44,7 +44,7 @@ def create_venv() -> None:
 
 def install_deps(polars_only: bool = False) -> None:
     print("\nUpgrading pip...")
-    run([str(VENV_PIP), "install", "--upgrade", "pip", "setuptools", "wheel", "-q"])
+    run([str(VENV_PYTHON), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "-q"])
 
     if polars_only:
         print("\nInstalling Polars-only dependencies (no PySpark)...")
@@ -55,14 +55,14 @@ def install_deps(polars_only: bool = False) -> None:
             "pytest>=7.0",
             "pytest-timeout>=2.2",
         ]
-        run([str(VENV_PIP), "install"] + packages + ["-q"])
+        run([str(VENV_PYTHON), "-m", "pip", "install"] + packages + ["-q"])
     else:
         print(f"\nInstalling all dependencies from {REQUIREMENTS_DEV.name}...")
-        run([str(VENV_PIP), "install", "-r", str(REQUIREMENTS_DEV), "-q"])
+        run([str(VENV_PYTHON), "-m", "pip", "install", "-r", str(REQUIREMENTS_DEV), "-q"])
 
     # Install the project itself in editable mode
     print("\nInstalling recon package (editable)...")
-    run([str(VENV_PIP), "install", "-e", str(SCRIPT_DIR), "-q"])
+    run([str(VENV_PYTHON), "-m", "pip", "install", "-e", str(SCRIPT_DIR), "-q"])
 
 
 def print_instructions(polars_only: bool) -> None:

@@ -763,17 +763,18 @@ class PolarsEngine(ReconEngine):
     def cleanup(self, cfg: ReconcileConfig) -> None:
         """Remove temp tables / directories."""
         if _is_databricks():
-            from ..helpers import get_spark
+            from ..helpers import get_spark, schema_fqn, table_fqn, safe_suffix
             spark = get_spark()
-            safe_run = cfg.run_id.replace("-", "_").replace(":", "_").replace(" ", "_")
+            safe_run = safe_suffix(cfg.run_id)
             prefix = f"{cfg.temp_prefix}_"
+            db = schema_fqn(cfg.output_catalog, cfg.output_schema)
             try:
-                tables = spark.sql(
-                    f"SHOW TABLES IN `{cfg.output_catalog}`.`{cfg.output_schema}` LIKE '{prefix}*{safe_run}'"
-                ).collect()
+                tables = spark.sql(f"SHOW TABLES IN {db}").collect()
                 for row in tables:
                     tname = row["tableName"]
-                    spark.sql(f"DROP TABLE IF EXISTS `{cfg.output_catalog}`.`{cfg.output_schema}`.`{tname}`")
+                    if tname.startswith(prefix) and safe_run in tname:
+                        fqn = table_fqn(cfg.output_catalog, cfg.output_schema, tname)
+                        spark.sql(f"DROP TABLE IF EXISTS {fqn}")
             except Exception as exc:
                 print(f"WARNING: Cleanup failed: {exc}")
         else:
@@ -798,7 +799,6 @@ class PolarsEngine(ReconEngine):
             "source_label": cfg.source_label,
             "left_table_name": cfg.left_table_name,
             "right_table_name": cfg.right_table_name,
-            "key_cols": ",".join(cfg.key_cols),
             "qtr_col": cfg.qtr_col,
             "critical_column_count": len(cfg.critical_cols),
             "noncritical_column_count": len(noncritical_cols),
@@ -827,7 +827,6 @@ class PolarsEngine(ReconEngine):
             "source_label": cfg.source_label,
             "left_table_name": cfg.left_table_name,
             "right_table_name": cfg.right_table_name,
-            "key_cols": ",".join(cfg.key_cols),
             "qtr_col": cfg.qtr_col,
             "critical_column_count": len(cfg.critical_cols),
             "noncritical_column_count": 0,

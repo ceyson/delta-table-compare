@@ -844,11 +844,20 @@ def _display_plots(results_df: pl.DataFrame, max_scale_rows: Optional[int] = Non
 # ---------------------------------------------------------------------------
 
 
+def _quote_id(name: str) -> str:
+    """Backtick-quote an identifier, stripping existing quotes first."""
+    stripped = name.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("`", "'", '"'):
+        stripped = stripped[1:-1]
+    return f"`{stripped}`"
+
+
 def cleanup_benchmark_tables(output_catalog: str, output_schema: str) -> None:
     """Drop all bench_left_*, bench_right_*, and benchmark_results tables."""
     spark = _get_spark()
+    db = f"{_quote_id(output_catalog)}.{_quote_id(output_schema)}"
 
-    tables = spark.sql(f"SHOW TABLES IN {output_catalog}.{output_schema}").collect()
+    tables = spark.sql(f"SHOW TABLES IN {db}").collect()
     dropped = 0
 
     for row in tables:
@@ -858,25 +867,26 @@ def cleanup_benchmark_tables(output_catalog: str, output_schema: str) -> None:
             or table_name.startswith("bench_right_")
             or table_name == "benchmark_results"
         ):
-            fqn = f"{output_catalog}.{output_schema}.{table_name}"
+            fqn = f"{db}.`{table_name}`"
             spark.sql(f"DROP TABLE IF EXISTS {fqn}")
             dropped += 1
 
-    print(f"Dropped {dropped} benchmark tables from {output_catalog}.{output_schema}")
+    print(f"Dropped {dropped} benchmark tables from {db}")
 
 
 def cleanup_recon_tables(output_catalog: str, output_schema: str) -> None:
     """Drop all recon_* output tables from schema. Use before re-running after schema changes."""
     spark = _get_spark()
+    db = f"{_quote_id(output_catalog)}.{_quote_id(output_schema)}"
 
-    tables = spark.sql(f"SHOW TABLES IN {output_catalog}.{output_schema}").collect()
+    tables = spark.sql(f"SHOW TABLES IN {db}").collect()
     dropped = 0
 
     for row in tables:
         table_name = row["tableName"]
         if table_name.startswith("recon_") or table_name.startswith("bench_"):
-            fqn = f"{output_catalog}.{output_schema}.{table_name}"
+            fqn = f"{db}.`{table_name}`"
             spark.sql(f"DROP TABLE IF EXISTS {fqn}")
             dropped += 1
 
-    print(f"Dropped {dropped} tables (recon_* + bench_*) from {output_catalog}.{output_schema}")
+    print(f"Dropped {dropped} tables (recon_* + bench_*) from {db}")

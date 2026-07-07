@@ -77,7 +77,18 @@ def _read_delta_via_spark(table_name: str) -> pl.LazyFrame:
     else:
         sdf = spark.table(table_name)
     arrow_table = sdf.toPandas()  # Spark → Pandas (Arrow-optimised)
-    return pl.from_pandas(arrow_table).lazy()
+    df = pl.from_pandas(arrow_table)
+    # Upcast narrow int types to Int64 to match Spark's LongType convention
+    # and prevent Delta schema merge conflicts on subsequent writes.
+    cast_map = {}
+    for col_name, dtype in zip(df.columns, df.dtypes):
+        if dtype in (pl.Int8, pl.Int16, pl.Int32):
+            cast_map[col_name] = pl.Int64
+        elif dtype in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+            cast_map[col_name] = pl.Int64
+    if cast_map:
+        df = df.cast(cast_map)
+    return df.lazy()
 
 
 # ---------------------------------------------------------------------------

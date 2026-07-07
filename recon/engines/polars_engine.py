@@ -110,13 +110,24 @@ def _write_via_spark(df: pl.DataFrame, table_name: str, mode: str) -> None:
     """Write a Polars DataFrame to Delta via Spark (Databricks path)."""
     from ..helpers import get_spark
     spark = get_spark()
-    # Cast all Int32 → Int64 before writing to avoid Delta schema merge conflicts
-    # (Spark uses LongType by default; Polars infers Int32 from Python int literals)
+    # Spark does not support unsigned Arrow types and uses LongType/DoubleType
+    # by default. Cast all narrow/unsigned types to their Spark-compatible equivalents.
+    _UPCAST_MAP = {
+        pl.UInt8: pl.Int16,
+        pl.UInt16: pl.Int32,
+        pl.UInt32: pl.Int64,
+        pl.UInt64: pl.Int64,
+        pl.Int8: pl.Int16,
+        pl.Int16: pl.Int32,
+        pl.Int32: pl.Int64,
+        pl.Float32: pl.Float64,
+    }
+    cast_map = {}
     for col_name, dtype in zip(df.columns, df.dtypes):
-        if dtype == pl.Int32:
-            df = df.cast({col_name: pl.Int64})
-        elif dtype == pl.Float32:
-            df = df.cast({col_name: pl.Float64})
+        if dtype in _UPCAST_MAP:
+            cast_map[col_name] = _UPCAST_MAP[dtype]
+    if cast_map:
+        df = df.cast(cast_map)
     spark_df = spark.createDataFrame(df.to_pandas())
     writer = spark_df.write.format("delta").mode(mode)
     if mode == "overwrite":

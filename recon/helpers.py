@@ -345,6 +345,22 @@ def _get_table_location(full_table_name: str) -> str:
     return f"{warehouse}/{schema}.db/{table}"
 
 
+def _upcast_narrow_ints(df: "DataFrame") -> "DataFrame":
+    """Widen IntegerType/ShortType/ByteType columns to LongType.
+
+    Prevents Delta schema merge conflicts when different engines (Spark vs
+    Polars) write to the same output table — Polars always produces Int64.
+    """
+    from pyspark.sql import types as _T
+    from pyspark.sql import functions as _F
+
+    _NARROW = (_T.ByteType, _T.ShortType, _T.IntegerType)
+    for field in df.schema.fields:
+        if isinstance(field.dataType, _NARROW):
+            df = df.withColumn(field.name, _F.col(field.name).cast(_T.LongType()))
+    return df
+
+
 def write_delta_append(df: DataFrame, full_table_name: str) -> None:  # noqa: F811
     """Append rows to a Delta table, creating it if needed.
 
@@ -355,6 +371,7 @@ def write_delta_append(df: DataFrame, full_table_name: str) -> None:  # noqa: F8
         df: DataFrame to write.
         full_table_name: Fully-qualified table name (catalog.schema.table).
     """
+    df = _upcast_narrow_ints(df)
     t0 = _time.perf_counter()
     if _is_databricks():
         (
@@ -395,6 +412,7 @@ def overwrite_delta_table(df: DataFrame, full_table_name: str) -> None:  # noqa:
         df: DataFrame to write.
         full_table_name: Fully-qualified table name (catalog.schema.table).
     """
+    df = _upcast_narrow_ints(df)
     t0 = _time.perf_counter()
     if _is_databricks():
         (

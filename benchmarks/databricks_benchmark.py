@@ -845,7 +845,7 @@ def _display_plots(results_df: pl.DataFrame, max_scale_rows: Optional[int] = Non
 
 
 def cleanup_benchmark_tables(output_catalog: str, output_schema: str) -> None:
-    """Drop all bench_left_* and bench_right_* tables from the benchmark schema."""
+    """Drop all bench_left_*, bench_right_*, and benchmark_results tables."""
     spark = _get_spark()
 
     tables = spark.sql(f"SHOW TABLES IN {output_catalog}.{output_schema}").collect()
@@ -853,9 +853,30 @@ def cleanup_benchmark_tables(output_catalog: str, output_schema: str) -> None:
 
     for row in tables:
         table_name = row["tableName"]
-        if table_name.startswith("bench_left_") or table_name.startswith("bench_right_"):
+        if (
+            table_name.startswith("bench_left_")
+            or table_name.startswith("bench_right_")
+            or table_name == "benchmark_results"
+        ):
             fqn = f"{output_catalog}.{output_schema}.{table_name}"
             spark.sql(f"DROP TABLE IF EXISTS {fqn}")
             dropped += 1
 
     print(f"Dropped {dropped} benchmark tables from {output_catalog}.{output_schema}")
+
+
+def cleanup_recon_tables(output_catalog: str, output_schema: str) -> None:
+    """Drop all recon_* output tables from schema. Use before re-running after schema changes."""
+    spark = _get_spark()
+
+    tables = spark.sql(f"SHOW TABLES IN {output_catalog}.{output_schema}").collect()
+    dropped = 0
+
+    for row in tables:
+        table_name = row["tableName"]
+        if table_name.startswith("recon_") or table_name.startswith("bench_"):
+            fqn = f"{output_catalog}.{output_schema}.{table_name}"
+            spark.sql(f"DROP TABLE IF EXISTS {fqn}")
+            dropped += 1
+
+    print(f"Dropped {dropped} tables (recon_* + bench_*) from {output_catalog}.{output_schema}")

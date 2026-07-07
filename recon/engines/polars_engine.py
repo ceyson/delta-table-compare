@@ -121,15 +121,16 @@ def _write_via_spark(df: pl.DataFrame, table_name: str, mode: str) -> None:
     """Write a Polars DataFrame to Delta via Spark (Databricks path)."""
     from ..helpers import get_spark
     spark = get_spark()
-    # Spark does not support unsigned Arrow types and uses LongType/DoubleType
-    # by default. Cast all narrow/unsigned types to their Spark-compatible equivalents.
+    # Spark uses LongType for all integers and DoubleType for floats.
+    # Polars may infer narrow/unsigned types that Spark cannot represent.
+    # Cast everything to Int64/Float64 to match Spark conventions exactly.
     _UPCAST_MAP = {
-        pl.UInt8: pl.Int16,
-        pl.UInt16: pl.Int32,
+        pl.UInt8: pl.Int64,
+        pl.UInt16: pl.Int64,
         pl.UInt32: pl.Int64,
         pl.UInt64: pl.Int64,
-        pl.Int8: pl.Int16,
-        pl.Int16: pl.Int32,
+        pl.Int8: pl.Int64,
+        pl.Int16: pl.Int64,
         pl.Int32: pl.Int64,
         pl.Float32: pl.Float64,
     }
@@ -797,13 +798,14 @@ class PolarsEngine(ReconEngine):
             "source_label": cfg.source_label,
             "left_table_name": cfg.left_table_name,
             "right_table_name": cfg.right_table_name,
+            "key_cols": ",".join(cfg.key_cols),
             "qtr_col": cfg.qtr_col,
             "critical_column_count": len(cfg.critical_cols),
             "noncritical_column_count": len(noncritical_cols),
             "total_compare_column_count": len(all_compare_cols),
             "hash_group_size": cfg.hash_group_size,
             "detail_mode": cfg.detail_mode,
-            "started_at": datetime.now().isoformat(),
+            "started_at": datetime.now(),
             "completed_at": None,
             "status": "RUNNING",
         }]).cast({
@@ -811,6 +813,8 @@ class PolarsEngine(ReconEngine):
             "noncritical_column_count": pl.Int64,
             "total_compare_column_count": pl.Int64,
             "hash_group_size": pl.Int64,
+            "started_at": pl.Datetime("us"),
+            "completed_at": pl.Datetime("us"),
         })
         _write_delta_append(meta, _table_ref(cfg, "run_metadata"))
 
@@ -823,6 +827,7 @@ class PolarsEngine(ReconEngine):
             "source_label": cfg.source_label,
             "left_table_name": cfg.left_table_name,
             "right_table_name": cfg.right_table_name,
+            "key_cols": ",".join(cfg.key_cols),
             "qtr_col": cfg.qtr_col,
             "critical_column_count": len(cfg.critical_cols),
             "noncritical_column_count": 0,
@@ -830,13 +835,15 @@ class PolarsEngine(ReconEngine):
             "hash_group_size": cfg.hash_group_size,
             "detail_mode": cfg.detail_mode,
             "started_at": None,
-            "completed_at": datetime.now().isoformat(),
+            "completed_at": datetime.now(),
             "status": status,
         }]).cast({
             "critical_column_count": pl.Int64,
             "noncritical_column_count": pl.Int64,
             "total_compare_column_count": pl.Int64,
             "hash_group_size": pl.Int64,
+            "started_at": pl.Datetime("us"),
+            "completed_at": pl.Datetime("us"),
         })
         try:
             _write_delta_append(meta, _table_ref(cfg, "run_metadata"))

@@ -44,6 +44,12 @@ CRITICAL_COLS = None
 # When False: compare only CRITICAL_COLS (fast, focused mode).
 COMPARE_ALL_COLUMNS = True
 
+# Performance tuning — controls how many Spark/Polars jobs are spawned.
+# These defaults matched the 30-min run on 220 quarters × 4,900 cols.
+HASH_GROUP_SIZE = 100           # Cols per hash group (49 groups for 4,900 cols)
+COMPARISON_BATCH_SIZE = 200     # Cols per Phase 4 comparison batch
+DETAIL_MODE = "sample"          # "summary" skips mismatch sampling (fastest)
+
 # Optional: project scaling to this many rows (for forecasting table)
 MAX_SCALE_ROWS = 4_000_000
 
@@ -110,7 +116,10 @@ results = run_benchmark_grid(
     change_rate=CHANGE_RATE,
     change_cols_count=CHANGE_COLS_COUNT,
     engines=ENGINES,
+    detail_mode=DETAIL_MODE,
     compare_all_columns=COMPARE_ALL_COLUMNS,
+    hash_group_size=HASH_GROUP_SIZE,
+    comparison_batch_size=COMPARISON_BATCH_SIZE,
     seed=42,
 )
 
@@ -155,7 +164,10 @@ display(results.to_pandas())
 #     change_rate=CHANGE_RATE,
 #     change_cols_count=CHANGE_COLS_COUNT,
 #     engines=ENGINES,
+#     detail_mode=DETAIL_MODE,
 #     compare_all_columns=False,
+#     hash_group_size=HASH_GROUP_SIZE,
+#     comparison_batch_size=COMPARISON_BATCH_SIZE,
 #     seed=42,
 # )
 # report_results(results_critical, max_scale_rows=MAX_SCALE_ROWS)

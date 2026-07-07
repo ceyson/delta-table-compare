@@ -74,10 +74,12 @@ def _inject_differences_spark(
     change_cols: Optional[list[str]] = None,
     seed: int = 123,
 ) -> None:
-    """Read a Delta table via Spark, inject numeric perturbations, write as new table.
+    """Read a Delta table via Spark, inject constant offsets, write as new table.
 
     Mutates `change_rate` fraction of rows in the specified numeric columns
-    by adding Gaussian noise. Does not add/remove rows.
+    by adding a fixed offset (+10 for floats, +5 for integers).  Uses a single
+    ``select`` instead of chained ``withColumn`` calls to avoid quadratic
+    Catalyst plan growth on wide tables.
     """
     from pyspark.sql import functions as F
     from pyspark.sql import types as T
@@ -92,43 +94,36 @@ def _inject_differences_spark(
             and f.name not in ("policy_id", "quarter_date")
         ]
 
-    # Create a deterministic row-level flag for which rows to mutate
-    # Use hash of key cols modulo to get a stable subset
+    change_col_set = set(change_cols)
+    schema_fields = {f.name: f.dataType for f in df.schema.fields}
+
+    # Deterministic row-level mutation flag via hash
     rng = random.Random(seed)
     salt = rng.randint(0, 2**31)
+    mutate_flag = (
+        F.abs(F.hash(F.concat_ws("|", *[F.col(c).cast("string") for c in df.columns[:3]])) + F.lit(salt))
+        % F.lit(int(1.0 / change_rate))
+    ) == F.lit(0)
 
-    # Add mutation flag: hash-based deterministic selection
-    df_flagged = df.withColumn(
-        "_bench_hash",
-        F.abs(F.hash(F.concat_ws("|", *[F.col(c).cast("string") for c in df.columns[:3]])) + F.lit(salt)),
-    ).withColumn(
-        "_bench_mutate",
-        (F.col("_bench_hash") % F.lit(int(1.0 / change_rate))) == F.lit(0),
-    )
+    # Build all column expressions in one pass (no chained withColumn)
+    select_exprs = []
+    for col_name in df.columns:
+        c = F.col(f"`{col_name}`")
+        if col_name in change_col_set:
+            dt = schema_fields[col_name]
+            if isinstance(dt, (T.DoubleType, T.FloatType)):
+                expr = F.when(mutate_flag, c + F.lit(10.0)).otherwise(c)
+            elif isinstance(dt, (T.IntegerType, T.LongType)):
+                expr = F.when(mutate_flag, c + F.lit(5).cast(dt)).otherwise(c)
+            else:
+                expr = c
+            select_exprs.append(expr.alias(col_name))
+        else:
+            select_exprs.append(c)
 
-    # Apply perturbation to selected columns
-    for col in change_cols:
-        field = next((f for f in df.schema.fields if f.name == col), None)
-        if field is None:
-            continue
-        if isinstance(field.dataType, (T.DoubleType, T.FloatType)):
-            perturbation = F.randn(seed=seed) * F.lit(10.0)
-            df_flagged = df_flagged.withColumn(
-                col,
-                F.when(F.col("_bench_mutate"), F.col(col) + perturbation).otherwise(F.col(col)),
-            )
-        elif isinstance(field.dataType, (T.IntegerType, T.LongType)):
-            perturbation = (F.randn(seed=seed) * F.lit(5.0)).cast(field.dataType)
-            df_flagged = df_flagged.withColumn(
-                col,
-                F.when(F.col("_bench_mutate"), F.col(col) + perturbation).otherwise(F.col(col)),
-            )
-
-    # Drop helper columns and write
-    df_final = df_flagged.drop("_bench_hash", "_bench_mutate")
-    df_final.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(
-        target_table_fqn
-    )
+    df.select(*select_exprs).write.format("delta").mode("overwrite").option(
+        "overwriteSchema", "true"
+    ).saveAsTable(target_table_fqn)
 
 
 def prepare_benchmark_data(
@@ -257,6 +252,8 @@ def run_single_benchmark(
     change_rate: float,
     detail_mode: str = "sample",
     compare_all_columns: bool = True,
+    hash_group_size: int = 100,
+    comparison_batch_size: int = 200,
 ) -> list[BenchmarkResult]:
     """Run a full reconciliation and return per-phase timing results."""
     from recon.config import ReconcileConfig
@@ -297,6 +294,8 @@ def run_single_benchmark(
             detail_mode=detail_mode,
             sample_per_column=5,
             cleanup_tmp_tables=True,
+            hash_group_size=hash_group_size,
+            comparison_batch_size=comparison_batch_size,
         )
 
         engine = get_engine(engine_name)
@@ -418,6 +417,8 @@ def run_benchmark_grid(
     detail_mode: str = "sample",
     seed: int = 42,
     compare_all_columns: bool = True,
+    hash_group_size: int = 100,
+    comparison_batch_size: int = 200,
 ) -> pl.DataFrame:
     """Run the benchmark grid: quarter_grid x engines.
 
@@ -436,6 +437,10 @@ def run_benchmark_grid(
         seed: Random seed.
         compare_all_columns: When True, compare all columns. When False,
             compare only critical_cols (fast, focused mode).
+        hash_group_size: Columns per hash group (larger = fewer groups = fewer
+            Phase 4 jobs). Default 100.
+        comparison_batch_size: Columns per Phase 4 comparison batch (larger =
+            fewer Spark/Polars jobs). Default 200.
 
     Returns:
         Polars DataFrame with all benchmark results.
@@ -488,6 +493,8 @@ def run_benchmark_grid(
                 change_rate=change_rate,
                 detail_mode=detail_mode,
                 compare_all_columns=compare_all_columns,
+                hash_group_size=hash_group_size,
+                comparison_batch_size=comparison_batch_size,
             )
             all_results.extend(results)
 

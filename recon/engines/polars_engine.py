@@ -777,7 +777,12 @@ class PolarsEngine(ReconEngine):
             "started_at": datetime.now().isoformat(),
             "completed_at": None,
             "status": "RUNNING",
-        }])
+        }]).cast({
+            "critical_column_count": pl.Int64,
+            "noncritical_column_count": pl.Int64,
+            "total_compare_column_count": pl.Int64,
+            "hash_group_size": pl.Int64,
+        })
         _write_delta_append(meta, _table_ref(cfg, "run_metadata"))
 
     def mark_run_complete(self, cfg: ReconcileConfig, status: str) -> None:
@@ -798,7 +803,12 @@ class PolarsEngine(ReconEngine):
             "started_at": None,
             "completed_at": datetime.now().isoformat(),
             "status": status,
-        }])
+        }]).cast({
+            "critical_column_count": pl.Int64,
+            "noncritical_column_count": pl.Int64,
+            "total_compare_column_count": pl.Int64,
+            "hash_group_size": pl.Int64,
+        })
         try:
             _write_delta_append(meta, _table_ref(cfg, "run_metadata"))
         except Exception as exc:

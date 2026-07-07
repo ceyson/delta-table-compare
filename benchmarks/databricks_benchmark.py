@@ -334,8 +334,15 @@ def run_single_benchmark(
             changed_keys, total_matched_per_qtr = engine.phase2_key_recon(
                 cfg, left_hashes, right_hashes, len(groups)
             )
+            # Polars returns a DataFrame (has .height); Spark returns a table name string
+            if hasattr(changed_keys, "height"):
+                ck_count = changed_keys.height
+            elif isinstance(changed_keys, str):
+                ck_count = _get_spark().table(changed_keys).count()
+            else:
+                ck_count = "?"
             results.append(_result("phase2_key_recon", time.perf_counter() - t0,
-                                   f"{changed_keys.height if hasattr(changed_keys, 'height') else changed_keys.count()} changed keys"))
+                                   f"{ck_count} changed keys"))
 
             # Phase 3
             t0 = time.perf_counter()

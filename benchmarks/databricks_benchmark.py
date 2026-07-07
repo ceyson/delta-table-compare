@@ -306,6 +306,7 @@ def run_single_benchmark(
         engine.setup(cfg)
         engine.validate_tables(cfg)
         all_compare_cols = engine.resolve_compare_cols(cfg)
+        n_cols = len(all_compare_cols)
         noncritical_cols = [c for c in all_compare_cols if c not in set(cfg.critical_cols)]
         groups = build_column_groups(all_compare_cols, list(cfg.critical_cols), cfg.hash_group_size)
         engine.write_run_metadata(cfg, all_compare_cols, noncritical_cols)
@@ -550,13 +551,13 @@ def _display_summary_table(results_df: pl.DataFrame) -> None:
         status_color = "#2d8a4e" if row["status"] == "success" else "#c0392b"
         rows_html.append(
             f"<tr>"
-            f"<td>{row['engine']}</td>"
+            f"<td style='text-align:left'>{row['engine']}</td>"
             f"<td style='text-align:right'>{row['n_quarters']}</td>"
             f"<td style='text-align:right'>{row['n_rows_total']:,}</td>"
             f"<td style='text-align:right'>{row['n_columns']}</td>"
             f"<td style='text-align:right'>{row['change_rate']:.0%}</td>"
             f"<td style='text-align:right;font-weight:bold'>{row['elapsed_seconds']:.3f}s</td>"
-            f"<td style='color:{status_color}'>{row['status']}</td>"
+            f"<td style='text-align:left;color:{status_color}'>{row['status']}</td>"
             f"</tr>"
         )
 
@@ -575,7 +576,7 @@ def _display_summary_table(results_df: pl.DataFrame) -> None:
     <p class="section-title">Benchmark Summary</p>
     <table class="bench-table">
         <thead>
-            <tr><th>Engine</th><th>Quarters</th><th>Rows</th><th>Cols</th><th>Change%</th><th>Total Time</th><th>Status</th></tr>
+            <tr><th style='text-align:left'>Engine</th><th style='text-align:right'>Quarters</th><th style='text-align:right'>Rows</th><th style='text-align:right'>Cols</th><th style='text-align:right'>Change%</th><th style='text-align:right'>Total Time</th><th style='text-align:left'>Status</th></tr>
         </thead>
         <tbody>{''.join(rows_html)}</tbody>
     </table>
@@ -614,11 +615,11 @@ def _compute_speedup_rows(totals: pl.DataFrame) -> str:
                 faster = "Polars" if ratio > 1 else "Spark"
                 color = "#2d8a4e" if ratio > 1 else "#c0392b"
                 rows.append(
-                    f"<tr><td>{n_q}</td>"
+                    f"<tr><td style='text-align:right'>{n_q}</td>"
                     f"<td style='text-align:right'>{polars_secs:.3f}s</td>"
                     f"<td style='text-align:right'>{spark_secs:.3f}s</td>"
                     f"<td style='text-align:right;color:{color};font-weight:bold'>{ratio:.1f}x</td>"
-                    f"<td style='color:{color}'>{faster} faster</td></tr>"
+                    f"<td style='text-align:left;color:{color}'>{faster} faster</td></tr>"
                 )
 
     if not rows:
@@ -627,7 +628,7 @@ def _compute_speedup_rows(totals: pl.DataFrame) -> str:
     return f"""
     <p class="section-title" style="margin-top:20px">Engine Comparison (Spark / Polars ratio)</p>
     <table class="bench-table">
-        <thead><tr><th>Quarters</th><th>Polars</th><th>Spark</th><th>Ratio</th><th>Winner</th></tr></thead>
+        <thead><tr><th style='text-align:right'>Quarters</th><th style='text-align:right'>Polars</th><th style='text-align:right'>Spark</th><th style='text-align:right'>Ratio</th><th style='text-align:left'>Winner</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
     </table>
     """
@@ -663,18 +664,18 @@ def _display_phase_breakdown(results_df: pl.DataFrame) -> None:
 
         rows_html.append(
             f"<tr>"
-            f"<td>{row['engine']}</td>"
-            f"<td><code>{row['phase']}</code></td>"
+            f"<td style='text-align:left'>{row['engine']}</td>"
+            f"<td style='text-align:left'><code>{row['phase']}</code></td>"
             f"<td style='text-align:right'>{row['elapsed_seconds']:.4f}s</td>"
             f"<td style='text-align:right;color:#666'>{pct}</td>"
-            f"<td style='color:#888'>{row['notes']}</td>"
+            f"<td style='text-align:left;color:#888'>{row['notes']}</td>"
             f"</tr>"
         )
 
     html = f"""
     <p class="section-title" style="margin-top:20px">Phase Breakdown ({max_q} quarters)</p>
     <table class="bench-table">
-        <thead><tr><th>Engine</th><th>Phase</th><th>Time</th><th>% of Total</th><th>Notes</th></tr></thead>
+        <thead><tr><th style='text-align:left'>Engine</th><th style='text-align:left'>Phase</th><th style='text-align:right'>Time</th><th style='text-align:right'>% of Total</th><th style='text-align:left'>Notes</th></tr></thead>
         <tbody>{''.join(rows_html)}</tbody>
     </table>
     """
@@ -729,7 +730,7 @@ def _display_scaling_projection(
 
         rows_html.append(
             f"<tr>"
-            f"<td>{eng}</td>"
+            f"<td style='text-align:left'>{eng}</td>"
             f"<td style='text-align:right'>{slope * 1e6:.4f}</td>"
             f"<td style='text-align:right'>{intercept:.2f}s</td>"
             f"<td style='text-align:right'>{r_squared:.4f}</td>"
@@ -740,12 +741,12 @@ def _display_scaling_projection(
     if not rows_html:
         return
 
-    proj_header = f"<th>Projected ({max_scale_rows:,} rows)</th>" if max_scale_rows else "<th>Projected</th>"
+    proj_header = f"<th style='text-align:right'>Projected ({max_scale_rows:,} rows)</th>" if max_scale_rows else "<th style='text-align:right'>Projected</th>"
 
     html = f"""
     <p class="section-title" style="margin-top:20px">Scaling Projection (linear fit: time = slope &times; rows + intercept)</p>
     <table class="bench-table">
-        <thead><tr><th>Engine</th><th>Slope (s/Mrow)</th><th>Intercept</th><th>R&sup2;</th>{proj_header}</tr></thead>
+        <thead><tr><th style='text-align:left'>Engine</th><th style='text-align:right'>Slope (s/Mrow)</th><th style='text-align:right'>Intercept</th><th style='text-align:right'>R&sup2;</th>{proj_header}</tr></thead>
         <tbody>{''.join(rows_html)}</tbody>
     </table>
     """

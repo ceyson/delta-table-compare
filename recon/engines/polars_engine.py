@@ -226,7 +226,13 @@ class PolarsEngine(ReconEngine):
             raise ValueError(f"Missing columns from right table: {missing_right[:50]}")
 
     def resolve_compare_cols(self, cfg: ReconcileConfig) -> list[str]:
-        """Determine the full set of columns to compare."""
+        """Determine the full set of columns to compare.
+
+        When ``cfg.compare_all_columns`` is False, only critical_cols are
+        compared (fast, focused mode).
+        """
+        if not cfg.compare_all_columns:
+            return sorted(cfg.critical_cols)
         left_cols = set(_read_delta(cfg.left_table_name).collect_schema().names())
         right_cols = set(_read_delta(cfg.right_table_name).collect_schema().names())
         common = left_cols & right_cols

@@ -256,6 +256,7 @@ def run_single_benchmark(
     n_cols: int,
     change_rate: float,
     detail_mode: str = "sample",
+    compare_all_columns: bool = True,
 ) -> list[BenchmarkResult]:
     """Run a full reconciliation and return per-phase timing results."""
     from recon.config import ReconcileConfig
@@ -289,6 +290,7 @@ def run_single_benchmark(
             qtr_col=qtr_col,
             critical_cols=critical_cols,
             all_feature_cols=all_feature_cols,
+            compare_all_columns=compare_all_columns,
             run_id=run_id,
             source_label="BENCHMARK",
             engine=engine_name,
@@ -414,6 +416,7 @@ def run_benchmark_grid(
     engines: list[str] = None,
     detail_mode: str = "sample",
     seed: int = 42,
+    compare_all_columns: bool = True,
 ) -> pl.DataFrame:
     """Run the benchmark grid: quarter_grid x engines.
 
@@ -430,6 +433,8 @@ def run_benchmark_grid(
         engines: Engines to benchmark (default ["polars", "spark"]).
         detail_mode: Reconciliation detail mode.
         seed: Random seed.
+        compare_all_columns: When True, compare all columns. When False,
+            compare only critical_cols (fast, focused mode).
 
     Returns:
         Polars DataFrame with all benchmark results.
@@ -443,7 +448,7 @@ def run_benchmark_grid(
     print("DATABRICKS PRODUCTION BENCHMARK")
     print(f"Source: {source_table}")
     print(f"Grid: {quarter_grid} quarters x {engines} engines")
-    print(f"Change rate: {change_rate:.0%}, detail_mode: {detail_mode}")
+    print(f"Change rate: {change_rate:.0%}, detail_mode: {detail_mode}, compare_all_columns: {compare_all_columns}")
     print("=" * 70)
 
     all_results: list[BenchmarkResult] = []
@@ -481,6 +486,7 @@ def run_benchmark_grid(
                 n_cols=prep_info["n_cols"],
                 change_rate=change_rate,
                 detail_mode=detail_mode,
+                compare_all_columns=compare_all_columns,
             )
             all_results.extend(results)
 
@@ -833,7 +839,9 @@ def _display_plots(results_df: pl.DataFrame, max_scale_rows: Optional[int] = Non
         ax2.set_xlabel("")
         ax2.set_ylabel("Elapsed Seconds", fontsize=11)
         ax2.set_title(f"Phase Breakdown ({max_q} quarters)", fontsize=13, fontweight="bold")
-        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=35, ha="right", fontsize=9)
+        ax2.tick_params(axis="x", rotation=35, labelsize=9)
+        for label in ax2.get_xticklabels():
+            label.set_ha("right")
         ax2.legend(title="Engine", fontsize=10)
         plt.tight_layout()
         plt.show()

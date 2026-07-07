@@ -76,6 +76,48 @@ class TestChunkList:
         assert chunk_list([], 5) == []
 
 
+class TestResolveAllCompareColsCriticalOnly:
+    """Test that compare_all_columns=False returns only critical_cols."""
+
+    def test_returns_only_critical_cols(self):
+        from recon.config import ReconcileConfig
+        from recon.helpers import resolve_all_compare_cols
+
+        cfg = ReconcileConfig(
+            left_table_name="default.dummy_left",
+            right_table_name="default.dummy_right",
+            output_catalog="spark_catalog",
+            output_schema="default",
+            key_cols=["id", "quarter_date"],
+            qtr_col="quarter_date",
+            critical_cols=["col_b", "col_a", "col_c"],
+            compare_all_columns=False,
+            run_id="test_critical_only",
+        )
+        result = resolve_all_compare_cols(cfg)
+        assert result == sorted(["col_a", "col_b", "col_c"])
+
+    def test_does_not_read_tables(self):
+        """When compare_all_columns=False, no Spark table access is needed."""
+        from recon.config import ReconcileConfig
+        from recon.helpers import resolve_all_compare_cols
+
+        cfg = ReconcileConfig(
+            left_table_name="nonexistent.table.left",
+            right_table_name="nonexistent.table.right",
+            output_catalog="spark_catalog",
+            output_schema="default",
+            key_cols=["id", "quarter_date"],
+            qtr_col="quarter_date",
+            critical_cols=["x", "y"],
+            compare_all_columns=False,
+            run_id="test_no_table_access",
+        )
+        # Should NOT raise even though tables don't exist
+        result = resolve_all_compare_cols(cfg)
+        assert result == ["x", "y"]
+
+
 class TestBuildColumnGroups:
     def test_critical_first(self):
         from recon.helpers import build_column_groups

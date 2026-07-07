@@ -508,9 +508,14 @@ def validate_columns_exist(cfg: ReconcileConfig) -> None:
 def resolve_all_compare_cols(cfg: ReconcileConfig) -> list[str]:
     """Determine the full set of columns to compare.
 
-    If ``cfg.all_feature_cols`` is specified, only those columns (present in
-    both tables and not in key_cols) are used.  Otherwise, all columns
-    common to both tables (excluding keys) are compared.
+    Resolution order:
+
+    1. If ``cfg.compare_all_columns`` is ``False``, only
+       ``cfg.critical_cols`` are compared (fast, focused mode).
+    2. Else if ``cfg.all_feature_cols`` is specified, only those columns
+       (present in both tables and not in key_cols) are used.
+    3. Otherwise, all columns common to both tables (excluding keys) are
+       compared.
 
     Args:
         cfg: Active reconciliation configuration.
@@ -518,6 +523,9 @@ def resolve_all_compare_cols(cfg: ReconcileConfig) -> list[str]:
     Returns:
         Sorted list of column names to be compared.
     """
+    if not cfg.compare_all_columns:
+        return sorted(cfg.critical_cols)
+
     left_cols = set(get_spark().table(cfg.left_table_name).columns)
     right_cols = set(get_spark().table(cfg.right_table_name).columns)
     common = left_cols & right_cols

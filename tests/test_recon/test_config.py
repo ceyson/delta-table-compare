@@ -60,3 +60,11 @@ class TestReconcileConfigValidation:
     def test_source_label_set(self):
         cfg = self._minimal_cfg(source_label="EDW_PROD")
         assert cfg.source_label == "EDW_PROD"
+
+    def test_compare_all_columns_default_true(self):
+        cfg = self._minimal_cfg()
+        assert cfg.compare_all_columns is True
+
+    def test_compare_all_columns_false(self):
+        cfg = self._minimal_cfg(compare_all_columns=False)
+        assert cfg.compare_all_columns is False

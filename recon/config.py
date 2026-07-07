@@ -49,6 +49,10 @@ class ReconcileConfig:
     temp_prefix: str = "recon_tmp"
     final_prefix: str = "recon"
 
+    # When True, compare all common columns (or all_feature_cols if set).
+    # When False, compare only critical_cols — faster for focused reconciliation.
+    compare_all_columns: bool = True
+
     # Engine selection: "spark" or "polars"
     engine: str = "spark"
 

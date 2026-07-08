@@ -580,31 +580,36 @@ def phase3_group_triage(
     changed_keys = get_spark().table(changed_keys_table)
     changed_keys = changed_keys.cache()
 
-    group_changed_keys: dict[int, DataFrame] = {}
     key_col_selects = [colq(c).alias(c) for c in cfg.key_cols]
 
-    for gi in range(num_groups):
-        match_col = f"gh_{gi}_match"
-        keys_for_group = changed_keys.where(F.col(match_col) == False).select(  # noqa: E712
-            *key_col_selects
-        )
-        group_changed_keys[gi] = keys_for_group
+    # Count all groups in a single Spark job instead of N separate .count() calls.
+    count_exprs = [
+        F.sum(F.when(F.col(f"gh_{gi}_match") == False, 1).otherwise(0)).alias(f"gc_{gi}")  # noqa: E712
+        for gi in range(num_groups)
+    ]
+    count_row = changed_keys.agg(*count_exprs).collect()[0]
+    group_counts = {gi: int(count_row[f"gc_{gi}"] or 0) for gi in range(num_groups)}
 
-    # Report group-level change counts.
-    group_counts: list[tuple[int, int]] = []
+    # Build per-group key DataFrames only for groups that actually changed.
+    group_changed_keys: dict[int, DataFrame] = {}
     for gi in range(num_groups):
-        cnt = group_changed_keys[gi].count()
-        group_counts.append((gi, cnt))
+        if group_counts[gi] == 0:
+            group_changed_keys[gi] = changed_keys.where(F.lit(False)).select(*key_col_selects)
+        else:
+            match_col = f"gh_{gi}_match"
+            group_changed_keys[gi] = changed_keys.where(F.col(match_col) == False).select(  # noqa: E712
+                *key_col_selects
+            )
 
-    total_changed = get_spark().table(changed_keys_table).count()
-    nonzero_groups = sum(1 for _, cnt in group_counts if cnt > 0)
+    total_changed = changed_keys.count()
+    nonzero_groups = sum(1 for cnt in group_counts.values() if cnt > 0)
     print(
         f"Phase 3: {nonzero_groups}/{num_groups} groups have changes. Total changed rows: {total_changed}."
     )
 
-    for gi, cnt in group_counts:
-        if cnt > 0:
-            print(f"  Group {gi}: {cnt} rows changed.")
+    for gi in range(num_groups):
+        if group_counts[gi] > 0:
+            print(f"  Group {gi}: {group_counts[gi]} rows changed.")
 
     safe_unpersist(changed_keys)
     return group_changed_keys
@@ -946,10 +951,13 @@ def phase4_targeted_comparison(
     for gi, grp_cols in enumerate(groups):
         changed_keys_df = group_changed_keys[gi]
 
-        # Check if this group has any changes (cheaply, from Phase 3 counts).
-        grp_count = changed_keys_df.limit(1).count()
-        if grp_count == 0:
-            print(f"  Group {gi}: no changes, emitting zero-fill summary.")
+        # Skip empty groups without triggering a Spark job — Phase 3 already
+        # marked them with a where(F.lit(False)) sentinel.
+        try:
+            is_empty = changed_keys_df.isEmpty()
+        except AttributeError:
+            is_empty = changed_keys_df.limit(1).count() == 0
+        if is_empty:
             # Zero-fill summary for unchanged groups will be handled in Phase 5.
             continue
 

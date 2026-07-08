@@ -52,34 +52,110 @@ def _is_path(table_name: str) -> bool:
 # Read helpers
 # ---------------------------------------------------------------------------
 
-def _read_delta(table_name: str) -> pl.LazyFrame:
+def _read_delta(table_name: str, columns: list[str] | None = None) -> pl.LazyFrame:
     """Read a Delta table as a Polars LazyFrame.
 
     - **Local**: uses ``pl.scan_delta(path)``.
     - **Databricks**: reads via Spark, converts Arrow → Polars lazy.
+
+    Args:
+        table_name: FQN or path of the Delta table.
+        columns: Optional list of columns to project before collection.
+            On Databricks this pushes the projection into Spark so only
+            the needed columns are serialized to the driver.
     """
     if _is_databricks():
-        return _read_delta_via_spark(table_name)
+        return _read_delta_via_spark(table_name, columns=columns)
     if not _HAS_DELTALAKE:
         raise ImportError(
             "The 'deltalake' package is required for local Delta reads. "
             "Install with: pip install 'recon[polars]'"
         )
-    return pl.scan_delta(table_name)
+    lf = pl.scan_delta(table_name)
+    if columns:
+        lf = lf.select(columns)
+    return lf
 
 
-def _read_delta_via_spark(table_name: str) -> pl.LazyFrame:
-    """Read a Delta table through Spark and return a Polars LazyFrame."""
+def _read_delta_via_spark(
+    table_name: str, columns: list[str] | None = None
+) -> pl.LazyFrame:
+    """Read a Delta table through Spark and return a Polars LazyFrame.
+
+    For wide tables that exceed ``spark.driver.maxResultSize`` when
+    collected in one shot, this slices columns into chunks and collects
+    each slice independently, then horizontally concatenates the results.
+    This bypasses the result-size limit without requiring cluster config.
+
+    Args:
+        table_name: FQN or path of the Delta table.
+        columns: If provided, only these columns are collected from Spark.
+            This is critical for wide tables — projecting before collect
+            avoids serializing thousands of unneeded columns.
+    """
     from ..helpers import get_spark
     spark = get_spark()
     if _is_path(table_name):
         sdf = spark.read.format("delta").load(table_name)
     else:
         sdf = spark.table(table_name)
-    arrow_table = sdf.toPandas()  # Spark → Pandas (Arrow-optimised)
-    df = pl.from_pandas(arrow_table)
-    # Upcast narrow int types to Int64 to match Spark's LongType convention
-    # and prevent Delta schema merge conflicts on subsequent writes.
+
+    # Apply column projection in Spark before any collection
+    if columns:
+        sdf = sdf.select(*columns)
+
+    collect_cols = sdf.columns
+    n_rows = sdf.count()
+
+    # Estimate bytes: assume ~8 bytes per cell (numeric dominated).
+    # Spark serialization overhead is 2-3x raw size; stay well under 4 GB.
+    max_bytes_per_collect = 1 * 1024**3  # 1 GB target (conservative)
+    bytes_per_row = len(collect_cols) * 8
+    total_bytes = n_rows * bytes_per_row
+
+    # Build explicit Polars schema from Spark schema to avoid type inference
+    # failures from toPandas() (nullable int/float confusion across partitions).
+    from pyspark.sql import types as T
+    _SPARK_TO_POLARS = {
+        T.LongType: pl.Int64,
+        T.IntegerType: pl.Int64,
+        T.ShortType: pl.Int64,
+        T.ByteType: pl.Int64,
+        T.DoubleType: pl.Float64,
+        T.FloatType: pl.Float64,
+        T.StringType: pl.Utf8,
+        T.BooleanType: pl.Boolean,
+        T.DateType: pl.Date,
+        T.TimestampType: pl.Datetime("us"),
+    }
+    schema_overrides = {}
+    for field in sdf.schema.fields:
+        pl_type = _SPARK_TO_POLARS.get(type(field.dataType))
+        if pl_type is not None:
+            schema_overrides[field.name] = pl_type
+
+    def _spark_pdf_to_polars(pdf):
+        """Convert Pandas DataFrame to Polars with explicit schema overrides."""
+        applicable = {k: v for k, v in schema_overrides.items() if k in pdf.columns}
+        return pl.from_pandas(pdf, schema_overrides=applicable)
+
+    if total_bytes <= max_bytes_per_collect:
+        # Small enough to collect in one shot
+        df = _spark_pdf_to_polars(sdf.toPandas())
+    else:
+        # Slice columns into chunks that fit under the limit
+        cols_per_chunk = max(1, max_bytes_per_collect // (n_rows * 8))
+        col_chunks = [
+            collect_cols[i:i + cols_per_chunk]
+            for i in range(0, len(collect_cols), cols_per_chunk)
+        ]
+        frames = []
+        for chunk_cols in col_chunks:
+            chunk_pdf = sdf.select(*chunk_cols).toPandas()
+            frames.append(_spark_pdf_to_polars(chunk_pdf))
+        df = pl.concat(frames, how="horizontal")
+
+    # Upcast any remaining narrow int types to Int64
     cast_map = {}
     for col_name, dtype in zip(df.columns, df.dtypes):
         if dtype in (pl.Int8, pl.Int16, pl.Int32):
@@ -89,6 +165,28 @@ def _read_delta_via_spark(table_name: str) -> pl.LazyFrame:
     if cast_map:
         df = df.cast(cast_map)
     return df.lazy()
+
+
+def _get_column_names(table_name: str) -> list[str]:
+    """Return column names for a Delta table without collecting any data.
+
+    On Databricks this uses Spark schema inspection only (no row collection).
+    Locally it uses pl.scan_delta schema.
+    """
+    if _is_databricks():
+        from ..helpers import get_spark
+        spark = get_spark()
+        if _is_path(table_name):
+            sdf = spark.read.format("delta").load(table_name)
+        else:
+            sdf = spark.table(table_name)
+        return sdf.columns
+    if not _HAS_DELTALAKE:
+        raise ImportError(
+            "The 'deltalake' package is required for local Delta reads. "
+            "Install with: pip install 'recon[polars]'"
+        )
+    return pl.scan_delta(table_name).collect_schema().names()
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +311,8 @@ class PolarsEngine(ReconEngine):
 
     def validate_tables(self, cfg: ReconcileConfig) -> None:
         """Verify source tables exist and required columns are present."""
-        left_df = _read_delta(cfg.left_table_name)
-        right_df = _read_delta(cfg.right_table_name)
-        left_cols = set(left_df.collect_schema().names())
-        right_cols = set(right_df.collect_schema().names())
+        left_cols = set(_get_column_names(cfg.left_table_name))
+        right_cols = set(_get_column_names(cfg.right_table_name))
         required = set(cfg.key_cols) | set(cfg.critical_cols)
         missing_left = sorted(required - left_cols)
         missing_right = sorted(required - right_cols)
@@ -233,8 +329,8 @@ class PolarsEngine(ReconEngine):
         """
         if not cfg.compare_all_columns:
             return sorted(cfg.critical_cols)
-        left_cols = set(_read_delta(cfg.left_table_name).collect_schema().names())
-        right_cols = set(_read_delta(cfg.right_table_name).collect_schema().names())
+        left_cols = set(_get_column_names(cfg.left_table_name))
+        right_cols = set(_get_column_names(cfg.right_table_name))
         common = left_cols & right_cols
         excluded = set(cfg.key_cols)
         if cfg.all_feature_cols is not None:
@@ -249,8 +345,8 @@ class PolarsEngine(ReconEngine):
 
         hash_cols = list(cfg.key_cols) + all_compare_cols
 
-        left_lf = _read_delta(cfg.left_table_name)
-        right_lf = _read_delta(cfg.right_table_name)
+        left_lf = _read_delta(cfg.left_table_name, columns=hash_cols)
+        right_lf = _read_delta(cfg.right_table_name, columns=hash_cols)
 
         # Compute per-quarter checksums (sum of row hashes, reinterpret u64 -> i64)
         left_ck = (
@@ -337,7 +433,8 @@ class PolarsEngine(ReconEngine):
         print(f"Phase 1: Extracting row hashes for {len(changed_quarters)} quarters, {len(groups)} groups (Polars)...")
 
         def compute_hashes(table_name: str) -> pl.DataFrame:
-            lf = _read_delta(table_name).filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
+            needed = list(cfg.key_cols) + all_compare_cols
+            lf = _read_delta(table_name, columns=needed).filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
 
             # Build group hash expressions
             hash_exprs = []
@@ -448,15 +545,14 @@ class PolarsEngine(ReconEngine):
 
         key_cols = list(cfg.key_cols)
 
-        left_lf = _read_delta(cfg.left_table_name).filter(pl.col(cfg.qtr_col).is_in(both_sided))
-        right_lf = _read_delta(cfg.right_table_name).filter(pl.col(cfg.qtr_col).is_in(both_sided))
+        # Project only needed columns in Spark before collection
+        needed_cols = key_cols + [c for c in all_compare_cols if c not in key_cols]
+        left_lf = _read_delta(cfg.left_table_name, columns=needed_cols).filter(pl.col(cfg.qtr_col).is_in(both_sided))
+        right_lf = _read_delta(cfg.right_table_name, columns=needed_cols).filter(pl.col(cfg.qtr_col).is_in(both_sided))
 
-        # Inner join on keys — only select key cols + compare cols to reduce memory
-        left_select = key_cols + [c for c in all_compare_cols if c not in key_cols]
-        right_select = key_cols + [c for c in all_compare_cols if c not in key_cols]
         joined = (
-            left_lf.select(left_select)
-            .join(right_lf.select(right_select), on=key_cols, how="inner", suffix="_r")
+            left_lf
+            .join(right_lf, on=key_cols, how="inner", suffix="_r")
             .collect()
         )
 
@@ -545,18 +641,18 @@ class PolarsEngine(ReconEngine):
             print(f"  Group {gi}: {len(grp_cols)} columns, {changed_keys_df.height} changed rows...")
 
             # Read source data for changed quarters, filter to changed keys
+            # Project only needed columns in Spark before collection.
+            needed_cols = key_cols + grp_cols
             left_data = (
-                _read_delta(cfg.left_table_name)
+                _read_delta(cfg.left_table_name, columns=needed_cols)
                 .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
-                .select([pl.col(c) for c in key_cols + grp_cols])
                 .collect()
                 .join(changed_keys_df, on=key_cols, how="inner")
             )
 
             right_data = (
-                _read_delta(cfg.right_table_name)
+                _read_delta(cfg.right_table_name, columns=needed_cols)
                 .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
-                .select([pl.col(c) for c in key_cols + grp_cols])
                 .collect()
                 .join(changed_keys_df, on=key_cols, how="inner")
             )
@@ -656,9 +752,27 @@ class PolarsEngine(ReconEngine):
                                     cfg.right_label: str(row[rcol]) if row[rcol] is not None else None,
                                 })
 
-            # Write summary
+            # Write summary — use explicit schema to avoid type inference
+            # failures when early rows have None for float fields.
             if summary_rows:
-                summary_df = pl.DataFrame(summary_rows)
+                qtr_dtype = joined.schema[cfg.qtr_col]
+                _summary_schema = {
+                    "run_id": pl.Utf8,
+                    "source_label": pl.Utf8,
+                    cfg.qtr_col: qtr_dtype,
+                    "column": pl.Utf8,
+                    "is_numeric": pl.Boolean,
+                    "tolerance": pl.Float64,
+                    "changed_row_count": pl.Int64,
+                    "nonnull_compared_count": pl.Int64,
+                    "mismatch_count": pl.Int64,
+                    "null_mismatch_count": pl.Int64,
+                    "max_abs_diff": pl.Float64,
+                    "matched_row_count": pl.Int64,
+                    "mismatch_pct": pl.Float64,
+                    "null_mismatch_pct": pl.Float64,
+                }
+                summary_df = pl.DataFrame(summary_rows, schema=_summary_schema)
                 _write_delta_append(summary_df, _table_ref(cfg, "column_summary_by_quarter"))
 
             # Write mismatch samples
@@ -713,7 +827,24 @@ class PolarsEngine(ReconEngine):
                         "null_mismatch_pct": 0.0,
                     })
             if zero_rows:
-                _write_delta_append(pl.DataFrame(zero_rows), _table_ref(cfg, "column_summary_by_quarter"))
+                qtr_dtype = quarter_status.schema[cfg.qtr_col]
+                _zero_schema = {
+                    "run_id": pl.Utf8,
+                    "source_label": pl.Utf8,
+                    cfg.qtr_col: qtr_dtype,
+                    "column": pl.Utf8,
+                    "is_numeric": pl.Boolean,
+                    "tolerance": pl.Float64,
+                    "changed_row_count": pl.Int64,
+                    "nonnull_compared_count": pl.Int64,
+                    "mismatch_count": pl.Int64,
+                    "null_mismatch_count": pl.Int64,
+                    "max_abs_diff": pl.Float64,
+                    "matched_row_count": pl.Int64,
+                    "mismatch_pct": pl.Float64,
+                    "null_mismatch_pct": pl.Float64,
+                }
+                _write_delta_append(pl.DataFrame(zero_rows, schema=_zero_schema), _table_ref(cfg, "column_summary_by_quarter"))
 
         # Build all-quarter rollups
         summary_ref = _table_ref(cfg, "column_summary_by_quarter")

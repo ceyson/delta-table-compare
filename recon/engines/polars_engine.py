@@ -633,6 +633,21 @@ class PolarsEngine(ReconEngine):
         key_cols = list(cfg.key_cols)
         batch_count = 0
 
+        # Read left and right tables ONCE with all compare columns, filtered
+        # to changed quarters.  Slicing per-group happens in Polars (instant)
+        # instead of issuing separate Spark collections per group.
+        all_needed_cols = key_cols + [c for c in all_compare_cols if c not in key_cols]
+        left_full = (
+            _read_delta(cfg.left_table_name, columns=all_needed_cols)
+            .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
+            .collect()
+        )
+        right_full = (
+            _read_delta(cfg.right_table_name, columns=all_needed_cols)
+            .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
+            .collect()
+        )
+
         for gi, grp_cols in enumerate(groups):
             changed_keys_df = group_changed_keys[gi]
             if changed_keys_df.height == 0:
@@ -640,22 +655,10 @@ class PolarsEngine(ReconEngine):
 
             print(f"  Group {gi}: {len(grp_cols)} columns, {changed_keys_df.height} changed rows...")
 
-            # Read source data for changed quarters, filter to changed keys
-            # Project only needed columns in Spark before collection.
-            needed_cols = key_cols + grp_cols
-            left_data = (
-                _read_delta(cfg.left_table_name, columns=needed_cols)
-                .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
-                .collect()
-                .join(changed_keys_df, on=key_cols, how="inner")
-            )
-
-            right_data = (
-                _read_delta(cfg.right_table_name, columns=needed_cols)
-                .filter(pl.col(cfg.qtr_col).is_in(changed_quarters))
-                .collect()
-                .join(changed_keys_df, on=key_cols, how="inner")
-            )
+            # Slice to group columns and filter to changed keys — pure Polars, no Spark.
+            select_cols = key_cols + grp_cols
+            left_data = left_full.select(select_cols).join(changed_keys_df, on=key_cols, how="inner")
+            right_data = right_full.select(select_cols).join(changed_keys_df, on=key_cols, how="inner")
 
             # Join left and right on keys
             joined = left_data.join(right_data, on=key_cols, how="inner", suffix="_r")

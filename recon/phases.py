@@ -127,29 +127,20 @@ def phase0_quarter_screening(
     quarter_status = quarter_status.cache()
     write_delta_append(quarter_status, final_table(cfg, "quarter_checksums"))
 
-    # Collect quarters that need row-level hashing (both sides have data but differ).
-    changed_rows = (
-        quarter_status.where(F.col("quarter_status") == "changed")
-        .select(cfg.qtr_col)
-        .orderBy(cfg.qtr_col)
-        .collect()
-    )
-    changed_quarters = [r[cfg.qtr_col] for r in changed_rows]
+    # Single collect — quarter_status is tiny (one row per quarter).
+    all_qtr_rows = quarter_status.collect()
 
-    # One-sided quarters are handled separately (row_status emitted from Phase 0 data).
-    onesided_rows = (
-        quarter_status.where(F.col("quarter_status").isin("left_only", "right_only"))
-        .select(cfg.qtr_col)
-        .collect()
+    changed_quarters = sorted(
+        r[cfg.qtr_col] for r in all_qtr_rows if r["quarter_status"] == "changed"
     )
+    onesided_rows = [
+        r for r in all_qtr_rows if r["quarter_status"] in ("left_only", "right_only")
+    ]
+    identical_rows = [
+        r for r in all_qtr_rows if r["quarter_status"] == "identical"
+    ]
 
-    identical_rows = (
-        quarter_status.where(F.col("quarter_status") == "identical")
-        .select(cfg.qtr_col, "left_row_count")
-        .collect()
-    )
-
-    total_quarters = quarter_status.count()
+    total_quarters = len(all_qtr_rows)
     identical_count = len(identical_rows)
     onesided_count = len(onesided_rows)
     print(f"Phase 0: {identical_count}/{total_quarters} quarters identical — skipped.")
@@ -443,8 +434,15 @@ def phase2_key_recon_and_row_triage(
     changed_keys_table = tmp_table(cfg, "changed_keys")
     overwrite_delta_table(changed_keys, changed_keys_table)
 
-    changed_count = get_spark().table(changed_keys_table).count()
-    matched_count = full_joined.where(F.col("row_status") == "matched").count()
+    # Compute both counts in a single pass over the cached full_joined.
+    counts_row = full_joined.agg(
+        F.sum(F.when(F.col("row_status") == "matched", 1).otherwise(0)).alias("matched"),
+        F.sum(F.when(
+            (F.col("row_status") == "matched") & (F.col("row_identical") == False), 1  # noqa: E712
+        ).otherwise(0)).alias("changed"),
+    ).collect()[0]
+    matched_count = int(counts_row["matched"])
+    changed_count = int(counts_row["changed"])
     print(
         f"Phase 2: {matched_count} matched rows, {changed_count} have differences ({100.0 * changed_count / max(matched_count, 1):.1f}%)."
     )
@@ -601,10 +599,9 @@ def phase3_group_triage(
                 *key_col_selects
             )
 
-    total_changed = changed_keys.count()
     nonzero_groups = sum(1 for cnt in group_counts.values() if cnt > 0)
     print(
-        f"Phase 3: {nonzero_groups}/{num_groups} groups have changes. Total changed rows: {total_changed}."
+        f"Phase 3: {nonzero_groups}/{num_groups} groups have changes."
     )
 
     for gi in range(num_groups):
@@ -1127,20 +1124,32 @@ def emit_zero_fill_for_unchanged_groups(
 
     meta = build_feature_meta(cfg, [c for grp in groups for c in grp])
 
+    # Compute qtrs_with_changes for ALL groups in a single Spark job instead
+    # of 2 jobs per group (limit+count, distinct+collect).
+    changed_keys_table = tmp_table(cfg, "changed_keys")
+    ck = get_spark().table(changed_keys_table)
+    group_qtr_sets: dict[int, set] = {gi: set() for gi in range(len(groups))}
+
+    # Single aggregation: collect_set of quarters per group where that group changed.
+    has_match_cols = [
+        gi for gi in range(len(groups)) if f"gh_{gi}_match" in ck.columns
+    ]
+    if has_match_cols:
+        agg_exprs = [
+            F.collect_set(
+                F.when(F.col(f"gh_{gi}_match") == False, colq(cfg.qtr_col))  # noqa: E712
+            ).alias(f"qtrs_{gi}")
+            for gi in has_match_cols
+        ]
+        result = ck.agg(*agg_exprs).collect()[0]
+        for gi in has_match_cols:
+            qtrs_list = result[f"qtrs_{gi}"]
+            if qtrs_list:
+                group_qtr_sets[gi] = {q for q in qtrs_list if q is not None}
+
     rows = []
     for gi, grp_cols in enumerate(groups):
-        # Determine which changed quarters already have Phase 4 data for this group.
-        grp_count = group_changed_keys[gi].limit(1).count()
-        if grp_count > 0:
-            qtrs_with_changes = set(
-                row[cfg.qtr_col]
-                for row in group_changed_keys[gi]
-                .select(cfg.qtr_col)
-                .distinct()
-                .collect()
-            )
-        else:
-            qtrs_with_changes = set()
+        qtrs_with_changes = group_qtr_sets[gi]
 
         # Emit zero-fill for every changed quarter where this group has no changes
         # (Phase 4 did not write a summary row for these quarter×column pairs).

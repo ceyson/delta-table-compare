@@ -58,6 +58,8 @@ Phase 5: Rollups ─────────────────────
 Output Delta Tables (9 tables)
 ```
 
+See [phases.md](phases.md) for a step-by-step breakdown of each pipeline stage (including the benchmark-reported step names) and a mapping of every step to the Delta artifacts it produces.
+
 ## Engine Abstraction
 
 The framework uses a strategy pattern for engine selection:

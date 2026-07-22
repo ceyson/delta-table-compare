@@ -372,32 +372,97 @@ def write_delta_append(df: DataFrame, full_table_name: str) -> None:  # noqa: F8
         full_table_name: Fully-qualified table name (catalog.schema.table).
     """
     df = _upcast_narrow_ints(df)
+
+    # --- TEMP DIAGNOSTIC (remove after root cause confirmed) ---
+    def _P(m):
+        print(f"[DELTA-DIAG] {m}", flush=True)
+    try:
+        _P(f"target: {full_table_name}")
+
+        # (a) Duplicate-column detection on the INCOMING DataFrame.
+        _names = [f.name for f in df.schema.fields]
+        _lower = [n.lower() for n in _names]
+        _dups = sorted({n for n in _names if _names.count(n) > 1})
+        _cidups = sorted({n for n in set(_lower) if _lower.count(n) > 1})
+        if _dups:
+            _P(f"!! DUPLICATE names (exact): {_dups}")
+        if _cidups:
+            _P(f"!! DUPLICATE names (case-insensitive): {_cidups}")
+        _P("INCOMING fields: "
+           + str([(f.name, f.dataType.simpleString(), f.nullable) for f in df.schema.fields]))
+
+        # (b) Resolve existing table schema, if any.
+        _existing = None
+        if _is_databricks():
+            _exists = get_spark().catalog.tableExists(full_table_name)
+            _P(f"exists: {_exists}")
+            if _exists:
+                _existing = get_spark().table(full_table_name).schema
+        else:
+            import os
+            _loc = _get_table_location(full_table_name)
+            _fs = _loc[5:] if _loc.startswith("file:") else _loc
+            _exists = os.path.exists(os.path.join(_fs, "_delta_log"))
+            _P(f"exists: {_exists}  location: {_loc}")
+            if _exists:
+                _existing = get_spark().read.format("delta").load(_loc).schema
+
+        # (c) Schema equality + per-field differences vs existing table.
+        if _existing is not None:
+            _P("EXISTING fields: "
+               + str([(f.name, f.dataType.simpleString(), f.nullable) for f in _existing.fields]))
+            _P(f"schema equal to existing: {_existing.json() == df.schema.json()}")
+            _ef = {f.name: f for f in _existing.fields}
+            _inf = {f.name: f for f in df.schema.fields}
+            for _n in sorted(set(_ef) | set(_inf)):
+                _e, _i = _ef.get(_n), _inf.get(_n)
+                if _e is None:
+                    _P(f"  field only in INCOMING: {_n} ({_i.dataType.simpleString()})")
+                elif _i is None:
+                    _P(f"  field only in EXISTING: {_n} ({_e.dataType.simpleString()})")
+                elif _e.dataType != _i.dataType:
+                    _P(f"  TYPE DIFF {_n}: existing={_e.dataType.simpleString()} "
+                       f"incoming={_i.dataType.simpleString()}")
+                elif _e.nullable != _i.nullable:
+                    _P(f"  NULLABLE DIFF {_n}: existing={_e.nullable} incoming={_i.nullable}")
+                elif _e.metadata != _i.metadata:
+                    _P(f"  METADATA DIFF {_n}: existing={_e.metadata} incoming={_i.metadata}")
+    except Exception as _e:
+        _P(f"diagnostic error (ignored): {_e}")
+    # --- END TEMP DIAGNOSTIC ---
+
     t0 = _time.perf_counter()
-    if _is_databricks():
-        (
-            df.write.format("delta")
-            .mode("append")
-            .option("mergeSchema", "true")
-            .saveAsTable(full_table_name)
-        )
-    else:
-        # Local mode: write to path, then register as table.
-        path = _get_table_location(full_table_name)
-        (
-            df.write.format("delta")
-            .mode("append")
-            .option("mergeSchema", "true")
-            .save(path)
-        )
-        spark = get_spark()
-        try:
-            spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
-        except Exception:
-            pass
-        spark.sql(
-            f"CREATE TABLE IF NOT EXISTS {full_table_name} "
-            f"USING DELTA LOCATION '{path}'"
-        )
+    try:  # TEMP DIAGNOSTIC
+        if _is_databricks():
+            (
+                df.write.format("delta")
+                .mode("append")
+                .option("mergeSchema", "true")
+                .saveAsTable(full_table_name)
+            )
+        else:
+            # Local mode: write to path, then register as table.
+            path = _get_table_location(full_table_name)
+            (
+                df.write.format("delta")
+                .mode("append")
+                .option("mergeSchema", "true")
+                .save(path)
+            )
+            spark = get_spark()
+            try:
+                spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+            except Exception:
+                pass
+            spark.sql(
+                f"CREATE TABLE IF NOT EXISTS {full_table_name} "
+                f"USING DELTA LOCATION '{path}'"
+            )
+    except Exception:  # TEMP DIAGNOSTIC
+        import traceback  # TEMP DIAGNOSTIC
+        print(f"[DELTA-DIAG] WRITE FAILED: {full_table_name}", flush=True)  # TEMP DIAGNOSTIC
+        print("[DELTA-DIAG] traceback:\n" + traceback.format_exc(), flush=True)  # TEMP DIAGNOSTIC
+        raise  # TEMP DIAGNOSTIC
     elapsed = _time.perf_counter() - t0
     _write_timings.record(full_table_name, "append", elapsed)
 

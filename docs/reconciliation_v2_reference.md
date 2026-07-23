@@ -142,6 +142,18 @@ matched_row_count
 
 All tables are Delta tables written with `mode("append")`. Each row carries a `run_id` and an optional `source_label` so multiple runs and data sources coexist in the same tables. Filter by `run_id` (and optionally `source_label`) when querying.
 
+**Persistence contract for the batching dimension.** The **aggregate artifacts**
+(`quarter_checksums`, `row_status_counts`, `column_summary_by_quarter`) persist
+the batching dimension (`cfg.qtr_col`) as a single canonical column named
+**`batch_key`**, always stored as a **string** (dates as `yyyy-MM-dd`,
+timestamps as `yyyy-MM-dd'T'HH:mm:ss.SSSSSS`, integral values base-10). This
+gives these shared tables an invariant schema, so runs whose source batching
+column is typed differently (Date, Integer, Long, …) can append safely. The
+**detail artifacts** (`row_status_detail`, `mismatch_sample`, `mismatch_detail`)
+instead preserve the **full native-typed business key** (`cfg.key_cols`) for
+row-level investigation and source-table joins; see the usage constraint in
+`docs/spec.md` (shared detail tables require type-consistent business keys).
+
 ---
 
 ### 4.1 `run_metadata`
@@ -179,7 +191,7 @@ All tables are Delta tables written with `mode("append")`. Each row carries a `r
 |--------|------|-------------|
 | `run_id` | string | Run identifier. |
 | `source_label` | string (nullable) | Source/warehouse label. `null` if not set. |
-| `<qtr_col>` | varies | Quarter/period value (column name matches `cfg.qtr_col`). |
+| `batch_key` | string | Batching dimension — canonical string form of `cfg.qtr_col` (e.g. `2020-03-31`). |
 | `left_checksum` | long | Aggregate hash for this quarter in the left table. `null` if the quarter does not exist on the left. |
 | `right_checksum` | long | Aggregate hash for this quarter in the right table. `null` if the quarter does not exist on the right. |
 | `left_row_count` | long | Number of rows in this quarter on the left side. `null` if absent. |
@@ -200,7 +212,7 @@ All tables are Delta tables written with `mode("append")`. Each row carries a `r
 |--------|------|-------------|
 | `run_id` | string | Run identifier. |
 | `source_label` | string (nullable) | Source/warehouse label. `null` if not set. |
-| `<qtr_col>` | varies | Quarter/period value. |
+| `batch_key` | string | Batching dimension — canonical string form of `cfg.qtr_col` (e.g. `2020-03-31`). |
 | `row_status` | string | One of: `"matched"` (composite key exists in **both** tables — says nothing about whether column values are the same), `"left_only"` (composite key exists only on the left — row was deleted or is absent from the right table), `"right_only"` (composite key exists only on the right — row is new or absent from the left table). |
 | `row_count` | long | Number of rows with this status in this quarter. |
 
@@ -240,7 +252,7 @@ All tables are Delta tables written with `mode("append")`. Each row carries a `r
 |--------|------|-------------|
 | `run_id` | string | Run identifier. |
 | `source_label` | string (nullable) | Source/warehouse label. `null` if not set. |
-| `<qtr_col>` | varies | Quarter/period value. |
+| `batch_key` | string | Batching dimension — canonical string form of `cfg.qtr_col` (e.g. `2020-03-31`). |
 | `column` | string | Feature column name. |
 | `left_type` | string | Data type of this column in the left table (e.g., `"DoubleType"`, `"StringType"`). |
 | `right_type` | string | Data type of this column in the right table. |
@@ -259,13 +271,13 @@ All tables are Delta tables written with `mode("append")`. Each row carries a `r
 
 > **Tip:** To get a per-quarter cell-level rollup (equivalent to the removed `rollup_by_quarter` table), use:
 > ```sql
-> SELECT run_id, source_label, quarter_date,
+> SELECT run_id, source_label, batch_key,
 >        SUM(matched_row_count) AS matched_cell_checks,
 >        SUM(mismatch_count) AS mismatch_cell_count,
 >        SUM(null_mismatch_count) AS null_mismatch_cell_count,
 >        SUM(mismatch_count) / NULLIF(SUM(matched_row_count), 0) AS mismatch_cell_pct
 > FROM recon_column_summary_by_quarter WHERE run_id = '<run_id>'
-> GROUP BY run_id, source_label, quarter_date
+> GROUP BY run_id, source_label, batch_key
 > ```
 
 ---
@@ -380,10 +392,10 @@ LIMIT 10
 ### Quarters with the most row-level changes
 
 ```sql
-SELECT quarter_date, row_status, row_count
+SELECT batch_key, row_status, row_count
 FROM   recon_row_status_counts
 WHERE  run_id = '<run_id>'
-ORDER BY quarter_date, row_status
+ORDER BY batch_key, row_status
 ```
 
 ### Sample mismatches for a specific column

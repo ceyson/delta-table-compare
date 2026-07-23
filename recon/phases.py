@@ -32,6 +32,8 @@ from .helpers import (
     get_schema_map,
     is_numeric_type,
     normalize_for_hash,
+    batch_key_col,
+    batch_key_value,
     build_column_groups,
     build_feature_meta,
 )
@@ -125,7 +127,23 @@ def phase0_quarter_screening(
     )
 
     quarter_status = quarter_status.cache()
-    write_delta_append(quarter_status, final_table(cfg, "quarter_checksums"))
+
+    # Persist under the invariant ``batch_key`` (string) schema.  The in-memory
+    # ``quarter_status`` keeps the real typed ``qtr_col`` for downstream logic.
+    qtr_type = quarter_status.schema[cfg.qtr_col].dataType
+    quarter_checksums_artifact = quarter_status.select(
+        "run_id",
+        "source_label",
+        batch_key_col(colq(cfg.qtr_col), qtr_type).alias("batch_key"),
+        "left_checksum",
+        "right_checksum",
+        "left_row_count",
+        "right_row_count",
+        "quarter_status",
+    )
+    write_delta_append(
+        quarter_checksums_artifact, final_table(cfg, "quarter_checksums")
+    )
 
     # Single collect — quarter_status is tiny (one row per quarter).
     all_qtr_rows = quarter_status.collect()
@@ -175,18 +193,17 @@ def emit_row_status_for_identical_quarters(
         (
             cfg.run_id,
             cfg.source_label,
-            r[cfg.qtr_col],
+            batch_key_value(r[cfg.qtr_col]),
             "matched",
             int(r["left_row_count"]),
         )
         for r in identical_collected
     ]
-    qtr_type = get_spark().table(cfg.left_table_name).schema[cfg.qtr_col].dataType
     schema = T.StructType(
         [
             T.StructField("run_id", T.StringType(), False),
             T.StructField("source_label", T.StringType(), True),
-            T.StructField(cfg.qtr_col, qtr_type, True),
+            T.StructField("batch_key", T.StringType(), True),
             T.StructField("row_status", T.StringType(), False),
             T.StructField("row_count", T.LongType(), False),
         ]
@@ -223,14 +240,21 @@ def emit_row_status_for_onesided_quarters(
             if status == "left_only"
             else int(r["right_row_count"])
         )
-        rows.append((cfg.run_id, cfg.source_label, r[cfg.qtr_col], status, count))
+        rows.append(
+            (
+                cfg.run_id,
+                cfg.source_label,
+                batch_key_value(r[cfg.qtr_col]),
+                status,
+                count,
+            )
+        )
 
-    qtr_type = get_spark().table(cfg.left_table_name).schema[cfg.qtr_col].dataType
     schema = T.StructType(
         [
             T.StructField("run_id", T.StringType(), False),
             T.StructField("source_label", T.StringType(), True),
-            T.StructField(cfg.qtr_col, qtr_type, True),
+            T.StructField("batch_key", T.StringType(), True),
             T.StructField("row_status", T.StringType(), False),
             T.StructField("row_count", T.LongType(), False),
         ]
@@ -401,9 +425,17 @@ def phase2_key_recon_and_row_triage(
     full_joined = full_joined.cache()
 
     # --- Row status counts ---
+    qtr_type = full_joined.schema[cfg.qtr_col].dataType
     row_status_counts = full_joined.groupBy(
         "run_id", "source_label", cfg.qtr_col, "row_status"
     ).agg(F.count(F.lit(1)).alias("row_count"))
+    row_status_counts = row_status_counts.select(
+        "run_id",
+        "source_label",
+        batch_key_col(colq(cfg.qtr_col), qtr_type).alias("batch_key"),
+        "row_status",
+        "row_count",
+    )
     write_delta_append(row_status_counts, final_table(cfg, "row_status_counts"))
 
     if cfg.write_row_status_detail:
@@ -845,6 +877,7 @@ def _enrich_and_write_summary(
         nonnull_counts_table: Temp table name with (qtr_col, column, nonnull_count).
     """
     nn = get_spark().table(nonnull_counts_table).alias("nn")
+    qtr_type = get_spark().table(cfg.left_table_name).schema[cfg.qtr_col].dataType
 
     enriched = (
         summary_df.alias("s")
@@ -858,7 +891,7 @@ def _enrich_and_write_summary(
         .select(
             F.col("s.run_id"),
             F.col("s.source_label"),
-            F.col(f"s.{cfg.qtr_col}"),
+            batch_key_col(F.col(f"s.{cfg.qtr_col}"), qtr_type).alias("batch_key"),
             F.col("s.column"),
             F.col("s.left_type"),
             F.col("s.right_type"),
@@ -1034,7 +1067,7 @@ def emit_zero_fill_for_identical_quarters(
                 (
                     cfg.run_id,
                     cfg.source_label,
-                    qtr_val,
+                    batch_key_value(qtr_val),
                     c,
                     str(meta[c]["left_type"]),
                     str(meta[c]["right_type"]),
@@ -1054,13 +1087,11 @@ def emit_zero_fill_for_identical_quarters(
     if not rows:
         return
 
-    qtr_type = get_spark().table(cfg.left_table_name).schema[cfg.qtr_col].dataType
-
     schema = T.StructType(
         [
             T.StructField("run_id", T.StringType(), False),
             T.StructField("source_label", T.StringType(), True),
-            T.StructField(cfg.qtr_col, qtr_type, True),
+            T.StructField("batch_key", T.StringType(), True),
             T.StructField("column", T.StringType(), False),
             T.StructField("left_type", T.StringType(), True),
             T.StructField("right_type", T.StringType(), True),
@@ -1162,7 +1193,7 @@ def emit_zero_fill_for_unchanged_groups(
                     (
                         cfg.run_id,
                         cfg.source_label,
-                        qtr_val,
+                        batch_key_value(qtr_val),
                         c,
                         str(meta[c]["left_type"]),
                         str(meta[c]["right_type"]),
@@ -1182,13 +1213,11 @@ def emit_zero_fill_for_unchanged_groups(
     if not rows:
         return
 
-    qtr_type = get_spark().table(cfg.left_table_name).schema[cfg.qtr_col].dataType
-
     schema = T.StructType(
         [
             T.StructField("run_id", T.StringType(), False),
             T.StructField("source_label", T.StringType(), True),
-            T.StructField(cfg.qtr_col, qtr_type, True),
+            T.StructField("batch_key", T.StringType(), True),
             T.StructField("column", T.StringType(), False),
             T.StructField("left_type", T.StringType(), True),
             T.StructField("right_type", T.StringType(), True),

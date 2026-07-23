@@ -111,9 +111,9 @@ def spark_mismatch_by_column(spark, table_name: str, run_id: str) -> dict[str, t
     }
 
 
-def spark_quarter_status(spark, table_name: str, run_id: str, qtr_col: str) -> dict[Any, str]:
-    """Read Spark quarter_checksums as ``{quarter -> quarter_status}``."""
+def spark_quarter_status(spark, table_name: str, run_id: str) -> dict[Any, str]:
+    """Read Spark quarter_checksums as ``{batch_key -> quarter_status}``."""
     from pyspark.sql import functions as F
 
     rows = spark.table(table_name).filter(F.col("run_id") == run_id).collect()
-    return {r[qtr_col]: r["quarter_status"] for r in rows}
+    return {r["batch_key"]: r["quarter_status"] for r in rows}

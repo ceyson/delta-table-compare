@@ -16,7 +16,7 @@ from typing import Any, Optional
 import pyarrow as pa
 
 from ..config import ReconcileConfig
-from ..helpers import get_write_timings
+from ..helpers import get_write_timings, batch_key_value, batch_key_unsupported_error
 from .base import ReconEngine
 
 try:
@@ -46,6 +46,42 @@ def _is_databricks() -> bool:
 def _is_path(table_name: str) -> bool:
     """Return True if *table_name* looks like a filesystem path."""
     return "/" in table_name or "\\" in table_name
+
+
+_BATCH_KEY_INTEGRAL_DTYPES = (
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+)
+
+
+def _assert_supported_batch_key_dtype(dtype: "pl.DataType", col_name: str) -> None:
+    """Validate that a Polars ``cfg.qtr_col`` dtype is a supported batch key.
+
+    Mirrors ``recon.helpers.assert_supported_batch_key_type`` (Spark) and raises
+    the same canonical error so both engines enforce one contract.
+    """
+    supported = (
+        dtype == pl.Utf8
+        or dtype in _BATCH_KEY_INTEGRAL_DTYPES
+        or dtype == pl.Date
+        or isinstance(dtype, pl.Datetime)
+    )
+    if not supported:
+        raise batch_key_unsupported_error(col_name, str(dtype))
+
+
+def _batch_key_expr(col_name: str) -> "pl.Expr":
+    """Canonical ``batch_key`` as a Polars expression.
+
+    Delegates element formatting to :func:`recon.helpers.batch_key_value` so the
+    Spark expression, the driver path, and the Polars engine all share a single
+    canonical implementation (see the contract in ``recon/helpers.py``).
+    """
+    return (
+        pl.col(col_name)
+        .map_elements(batch_key_value, return_dtype=pl.Utf8)
+        .alias("batch_key")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +357,25 @@ class PolarsEngine(ReconEngine):
         if missing_right:
             raise ValueError(f"Missing columns from right table: {missing_right[:50]}")
 
+        # Reject unsupported batching-column types before any reconciliation
+        # work.  Metadata-only schema inspection (mirrors _get_column_names) —
+        # never materializes the source table.
+        if _is_databricks():
+            from ..helpers import get_spark, assert_supported_batch_key_type
+            spark = get_spark()
+            if _is_path(cfg.left_table_name):
+                sdf = spark.read.format("delta").load(cfg.left_table_name)
+            else:
+                sdf = spark.table(cfg.left_table_name)
+            assert_supported_batch_key_type(
+                sdf.schema[cfg.qtr_col].dataType, cfg.qtr_col
+            )
+        else:
+            _assert_supported_batch_key_dtype(
+                pl.scan_delta(cfg.left_table_name).collect_schema()[cfg.qtr_col],
+                cfg.qtr_col,
+            )
+
     def resolve_compare_cols(self, cfg: ReconcileConfig) -> list[str]:
         """Determine the full set of columns to compare.
 
@@ -395,9 +450,10 @@ class PolarsEngine(ReconEngine):
             "row_count_right": "right_row_count",
         })
 
-        # Write quarter checksums artifact
+        # Write quarter checksums artifact under the invariant ``batch_key``
+        # schema.  In-memory ``quarter_status`` keeps the typed ``qtr_col``.
         artifact = quarter_status.select(
-            "run_id", "source_label", cfg.qtr_col,
+            "run_id", "source_label", _batch_key_expr(cfg.qtr_col),
             "left_checksum", "right_checksum",
             "left_row_count", "right_row_count", "quarter_status",
         )
@@ -493,6 +549,10 @@ class PolarsEngine(ReconEngine):
             joined
             .group_by("run_id", "source_label", cfg.qtr_col, "row_status")
             .agg(pl.len().alias("row_count"))
+            .select(
+                "run_id", "source_label", _batch_key_expr(cfg.qtr_col),
+                "row_status", "row_count",
+            )
         )
         _write_delta_append(row_status_counts, _table_ref(cfg, "row_status_counts"))
 
@@ -723,7 +783,7 @@ class PolarsEngine(ReconEngine):
                     summary_rows.append({
                         "run_id": cfg.run_id,
                         "source_label": cfg.source_label,
-                        cfg.qtr_col: qtr_val,
+                        "batch_key": batch_key_value(qtr_val),
                         "column": col,
                         "is_numeric": is_numeric,
                         "tolerance": tolerance,
@@ -758,11 +818,10 @@ class PolarsEngine(ReconEngine):
             # Write summary — use explicit schema to avoid type inference
             # failures when early rows have None for float fields.
             if summary_rows:
-                qtr_dtype = joined.schema[cfg.qtr_col]
                 _summary_schema = {
                     "run_id": pl.Utf8,
                     "source_label": pl.Utf8,
-                    cfg.qtr_col: qtr_dtype,
+                    "batch_key": pl.Utf8,
                     "column": pl.Utf8,
                     "is_numeric": pl.Boolean,
                     "tolerance": pl.Float64,
@@ -816,7 +875,7 @@ class PolarsEngine(ReconEngine):
                     zero_rows.append({
                         "run_id": cfg.run_id,
                         "source_label": cfg.source_label,
-                        cfg.qtr_col: qtr_val,
+                        "batch_key": batch_key_value(qtr_val),
                         "column": col,
                         "is_numeric": False,
                         "tolerance": 0.0,
@@ -830,11 +889,10 @@ class PolarsEngine(ReconEngine):
                         "null_mismatch_pct": 0.0,
                     })
             if zero_rows:
-                qtr_dtype = quarter_status.schema[cfg.qtr_col]
                 _zero_schema = {
                     "run_id": pl.Utf8,
                     "source_label": pl.Utf8,
-                    cfg.qtr_col: qtr_dtype,
+                    "batch_key": pl.Utf8,
                     "column": pl.Utf8,
                     "is_numeric": pl.Boolean,
                     "tolerance": pl.Float64,

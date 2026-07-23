@@ -94,6 +94,41 @@ Logic:
 
 ## Output Table Schemas
 
+### Persistence contracts (batching dimension)
+
+Output tables fall into two categories with different, deliberate contracts for
+how the batching dimension (`cfg.qtr_col`, e.g. `quarter_date`) is persisted:
+
+**Aggregate artifacts** — `quarter_checksums`, `row_status_counts`,
+`column_summary_by_quarter`:
+- The batching dimension is persisted as a single canonical column named
+  **`batch_key`**, always stored as a **string** (dates as `yyyy-MM-dd`,
+  timestamps as `yyyy-MM-dd'T'HH:mm:ss.SSSSSS`, integral values as their
+  base-10 string).
+- Because `batch_key` is always a string, these shared tables have an
+  **invariant schema**. Reconciliation runs whose source batching column is
+  represented differently (Date, Integer, Long, …) can safely append into the
+  same tables without `DELTA_FAILED_TO_MERGE_FIELDS`.
+
+**Detail artifacts** — `mismatch_sample`, `mismatch_detail`,
+`row_status_detail`:
+- These persist the **complete native-typed business key** (`cfg.key_cols`),
+  of which the batching column is one member.
+- Native key datatypes are **intentionally preserved** to support row-level
+  investigation and type-faithful joins back to the source tables.
+- Consequently, detail tables are intended for reconciliation runs whose
+  business-key datatypes remain **consistent** within a shared output schema.
+
+> **Usage constraint — shared detail tables require consistent business-key
+> datatypes.** Do not append to the same shared detail tables from
+> reconciliations whose business-key datatypes differ (e.g. a `Date`
+> `quarter_date` in one run and an `Integer` `quarter_date` in another). Doing
+> so raises `DELTA_FAILED_TO_MERGE_FIELDS` on the native key columns. If key
+> schemas must differ, use **separate output schemas** per dataset, or disable
+> detail output with **`detail_mode="summary"`** (and leave
+> `write_row_status_detail=False`, the default). This constraint does not apply
+> to the aggregate artifacts, whose `batch_key` schema is invariant.
+
 ### `run_metadata`
 
 | Column | Type | Description |
@@ -119,7 +154,7 @@ Logic:
 |--------|------|-------------|
 | run_id | string | Run identifier |
 | source_label | string | Source label |
-| quarter_date | date | Quarter value |
+| batch_key | string | Batching dimension (canonical string of `qtr_col`) |
 | left_checksum | long | Left table checksum |
 | right_checksum | long | Right table checksum |
 | left_row_count | long | Left row count |
@@ -132,7 +167,7 @@ Logic:
 |--------|------|-------------|
 | run_id | string | Run identifier |
 | source_label | string | Source label |
-| quarter_date | date | Quarter value |
+| batch_key | string | Batching dimension (canonical string of `qtr_col`) |
 | row_status | string | matched / left_only / right_only |
 | row_count | long | Count of rows in this status |
 
@@ -142,7 +177,7 @@ Logic:
 |--------|------|-------------|
 | run_id | string | Run identifier |
 | source_label | string | Source label |
-| quarter_date | date | Quarter value |
+| batch_key | string | Batching dimension (canonical string of `qtr_col`) |
 | column | string | Column name |
 | is_numeric | boolean | Whether column is numeric |
 | tolerance | double | Tolerance applied |
@@ -157,7 +192,7 @@ Logic:
 
 ### `column_summary_all_quarters`
 
-Same schema as `column_summary_by_quarter` but without `quarter_date` — aggregated across all quarters.
+Same schema as `column_summary_by_quarter` but without `batch_key` — aggregated across all quarters.
 
 ### `mismatch_sample`
 
@@ -165,10 +200,16 @@ Same schema as `column_summary_by_quarter` but without `quarter_date` — aggreg
 |--------|------|-------------|
 | run_id | string | Run identifier |
 | source_label | string | Source label |
-| (key columns) | varies | Composite key values |
+| (key columns) | varies (native) | Full business key, preserved with native source datatypes (includes the batching column) |
 | column | string | Column with mismatch |
 | left_value | string | Left value (cast to string) |
 | right_value | string | Right value (cast to string) |
+
+> **Note:** Unlike the aggregate artifacts, detail tables keep the batching
+> column in its **native type** as part of the composite key (see *Persistence
+> contracts* above). `mismatch_detail` (written when `detail_mode="full_direct"`)
+> and `row_status_detail` (written when `write_row_status_detail=True`) follow
+> the same native-key contract.
 
 ### `noisy_columns`
 
@@ -207,3 +248,24 @@ Same schema as `column_summary_by_quarter` but without `quarter_date` — aggreg
 | operation | string | append / overwrite |
 | elapsed_seconds | double | Write duration |
 | row_count | int | Rows written |
+
+## Migration Notes — `batch_key`
+
+The batching dimension in the three shared **aggregate artifacts** is now
+persisted as the canonical `batch_key` string column (previously the native
+`qtr_col`, e.g. `quarter_date`). One-time migration when upgrading an existing
+output schema:
+
+- **Regenerate the three aggregate artifacts.** Existing
+  `recon_quarter_checksums`, `recon_row_status_counts`, and
+  `recon_column_summary_by_quarter` tables carry the old native-typed batching
+  column and are incompatible with the new `batch_key STRING` schema. Drop them
+  (they are fully regenerated on the next reconciliation run) — e.g. via the
+  `cleanup_recon_tables` utility, or `DROP TABLE` on each. Appending into the
+  old tables without dropping would leave a mixed/polluted schema.
+- **Detail-table schemas are unchanged.** `mismatch_sample`, `mismatch_detail`,
+  and `row_status_detail` retain their existing native-typed composite key and
+  require **no** migration.
+- **Downstream queries** against the aggregate artifacts must reference
+  `batch_key` instead of `quarter_date` (values are the canonical string form of
+  the period; e.g. `2020-03-31`).

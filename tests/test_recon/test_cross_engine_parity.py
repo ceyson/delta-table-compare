@@ -29,6 +29,8 @@ import polars as pl
 from recon.config import ReconcileConfig
 from recon.runner import run_reconciliation
 
+from recon.helpers import batch_key_value
+
 from tests.test_recon._parity_helpers import (
     write_delta,
     run_polars_reconciliation,
@@ -149,7 +151,7 @@ def parity_env(local_spark, tmp_path_factory):
     )
     polars_cols = polars_mismatch_by_column(polars_cfg)
     spark_qstatus = spark_quarter_status(
-        spark, spark_outputs["quarter_checksums"], "parity_spark_001", "quarter_date"
+        spark, spark_outputs["quarter_checksums"], "parity_spark_001"
     )
     polars_qstatus = {
         k: v
@@ -167,7 +169,7 @@ def parity_env(local_spark, tmp_path_factory):
 def _read_polars_quarter_status(out_dir: str, run_id: str) -> dict:
     path = os.path.join(out_dir, "recon_quarter_checksums")
     df = pl.read_delta(path).filter(pl.col("run_id") == run_id)
-    return {r["quarter_date"]: r["quarter_status"] for r in df.iter_rows(named=True)}
+    return {r["batch_key"]: r["quarter_status"] for r in df.iter_rows(named=True)}
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +210,9 @@ def test_quarter_status_parity(parity_env):
     sp = parity_env["spark_qstatus"]
     po = parity_env["polars_qstatus"]
     for q in (Q0, Q1):
-        assert sp[q] == po[q], q
-    assert sp[Q0] == "identical"
-    assert sp[Q1] == "changed"
+        assert sp[batch_key_value(q)] == po[batch_key_value(q)], q
+    assert sp[batch_key_value(Q0)] == "identical"
+    assert sp[batch_key_value(Q1)] == "changed"
 
 
 # ---------------------------------------------------------------------------

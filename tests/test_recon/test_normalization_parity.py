@@ -34,6 +34,7 @@ import polars as pl
 
 from recon.config import ReconcileConfig
 from recon.runner import run_reconciliation
+from recon.helpers import batch_key_value
 
 from tests.test_recon._parity_helpers import (
     write_delta,
@@ -99,7 +100,7 @@ def _read_polars_qstatus(out_dir: str, run_id: str) -> dict:
     df = pl.read_delta(os.path.join(out_dir, "recon_quarter_checksums")).filter(
         pl.col("run_id") == run_id
     )
-    return {r["quarter_date"]: r["quarter_status"] for r in df.iter_rows(named=True)}
+    return {r["batch_key"]: r["quarter_status"] for r in df.iter_rows(named=True)}
 
 
 @pytest.fixture(scope="module")
@@ -153,7 +154,7 @@ def triage_env(local_spark, tmp_path_factory):
             spark, spark_outputs["column_summary_all_quarters"], "norm_triage_spark"
         ),
         "spark_qstatus": spark_quarter_status(
-            spark, spark_outputs["quarter_checksums"], "norm_triage_spark", "quarter_date"
+            spark, spark_outputs["quarter_checksums"], "norm_triage_spark"
         ),
         "polars_cols": polars_mismatch_by_column(polars_cfg),
         "polars_qstatus": _read_polars_qstatus(polars_out, "norm_triage_polars"),
@@ -203,7 +204,7 @@ def phase4_env(local_spark, tmp_path_factory):
 
 def test_spark_triage_suppresses_normalized_differences(triage_env):
     """Baseline: normalize-away Q1 diffs make the quarter identical in Spark."""
-    assert triage_env["spark_qstatus"][Q1] == "identical"
+    assert triage_env["spark_qstatus"][batch_key_value(Q1)] == "identical"
     for col in NORM_COLS:
         assert triage_env["spark_cols"][col] == (0, 0), col
 
@@ -219,7 +220,7 @@ def test_spark_triage_suppresses_normalized_differences(triage_env):
 )
 def test_polars_triage_matches_spark_normalization(triage_env):
     """Polars should suppress normalize-away diffs in triage like Spark does."""
-    assert triage_env["polars_qstatus"][Q1] == "identical"
+    assert triage_env["polars_qstatus"][batch_key_value(Q1)] == "identical"
     for col in NORM_COLS:
         assert triage_env["polars_cols"][col] == (0, 0), col
 

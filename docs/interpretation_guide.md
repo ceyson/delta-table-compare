@@ -43,10 +43,16 @@ ORDER BY mismatch_pct DESC
 ### How to read `row_status_counts`
 
 ```sql
-SELECT quarter_date, row_status, row_count
+SELECT batch_key, row_status, row_count
 FROM recon_row_status_counts
 WHERE run_id = '<latest_run_id>'
 ```
+
+> The aggregate artifacts (`quarter_checksums`, `row_status_counts`,
+> `column_summary_by_quarter`) expose the batching dimension as **`batch_key`**
+> — the canonical string form of `qtr_col` (e.g. `2020-03-31`). Detail tables
+> such as `recon_mismatch_sample` keep the original native key columns (e.g.
+> `quarter_date`).
 
 | Status | Meaning | Concern level |
 |--------|---------|---------------|

@@ -24,7 +24,7 @@ pyspark = pytest.importorskip("pyspark", reason="PySpark not installed")
 from pyspark.sql import functions as F
 
 from recon.config import ReconcileConfig
-from recon.helpers import build_column_groups
+from recon.helpers import build_column_groups, batch_key_value
 from recon.runner import run_reconciliation
 
 N_NUMERIC = 250
@@ -122,11 +122,11 @@ def test_quarter_status_identical_and_changed(multigroup_env):
     rows = spark.table(outputs["quarter_checksums"]).filter(
         F.col("run_id") == "mg_baseline_001"
     ).collect()
-    status = {r["quarter_date"]: r["quarter_status"] for r in rows}
+    status = {r["batch_key"]: r["quarter_status"] for r in rows}
 
-    assert status[quarters[0]] == "identical"
-    assert status[quarters[1]] == "changed"
-    assert status[quarters[2]] == "changed"
+    assert status[batch_key_value(quarters[0])] == "identical"
+    assert status[batch_key_value(quarters[1])] == "changed"
+    assert status[batch_key_value(quarters[2])] == "changed"
 
 
 def test_changed_columns_have_mismatches(multigroup_env):
@@ -168,7 +168,7 @@ def test_identical_quarter_zero_filled(multigroup_env):
 
     rows = spark.table(outputs["column_summary_by_quarter"]).filter(
         (F.col("run_id") == "mg_baseline_001")
-        & (F.col("quarter_date") == quarters[0])
+        & (F.col("batch_key") == batch_key_value(quarters[0]))
     ).collect()
 
     assert len(rows) > 0

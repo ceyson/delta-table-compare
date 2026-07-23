@@ -373,96 +373,32 @@ def write_delta_append(df: DataFrame, full_table_name: str) -> None:  # noqa: F8
     """
     df = _upcast_narrow_ints(df)
 
-    # --- TEMP DIAGNOSTIC (remove after root cause confirmed) ---
-    def _P(m):
-        print(f"[DELTA-DIAG] {m}", flush=True)
-    try:
-        _P(f"target: {full_table_name}")
-
-        # (a) Duplicate-column detection on the INCOMING DataFrame.
-        _names = [f.name for f in df.schema.fields]
-        _lower = [n.lower() for n in _names]
-        _dups = sorted({n for n in _names if _names.count(n) > 1})
-        _cidups = sorted({n for n in set(_lower) if _lower.count(n) > 1})
-        if _dups:
-            _P(f"!! DUPLICATE names (exact): {_dups}")
-        if _cidups:
-            _P(f"!! DUPLICATE names (case-insensitive): {_cidups}")
-        _P("INCOMING fields: "
-           + str([(f.name, f.dataType.simpleString(), f.nullable) for f in df.schema.fields]))
-
-        # (b) Resolve existing table schema, if any.
-        _existing = None
-        if _is_databricks():
-            _exists = get_spark().catalog.tableExists(full_table_name)
-            _P(f"exists: {_exists}")
-            if _exists:
-                _existing = get_spark().table(full_table_name).schema
-        else:
-            import os
-            _loc = _get_table_location(full_table_name)
-            _fs = _loc[5:] if _loc.startswith("file:") else _loc
-            _exists = os.path.exists(os.path.join(_fs, "_delta_log"))
-            _P(f"exists: {_exists}  location: {_loc}")
-            if _exists:
-                _existing = get_spark().read.format("delta").load(_loc).schema
-
-        # (c) Schema equality + per-field differences vs existing table.
-        if _existing is not None:
-            _P("EXISTING fields: "
-               + str([(f.name, f.dataType.simpleString(), f.nullable) for f in _existing.fields]))
-            _P(f"schema equal to existing: {_existing.json() == df.schema.json()}")
-            _ef = {f.name: f for f in _existing.fields}
-            _inf = {f.name: f for f in df.schema.fields}
-            for _n in sorted(set(_ef) | set(_inf)):
-                _e, _i = _ef.get(_n), _inf.get(_n)
-                if _e is None:
-                    _P(f"  field only in INCOMING: {_n} ({_i.dataType.simpleString()})")
-                elif _i is None:
-                    _P(f"  field only in EXISTING: {_n} ({_e.dataType.simpleString()})")
-                elif _e.dataType != _i.dataType:
-                    _P(f"  TYPE DIFF {_n}: existing={_e.dataType.simpleString()} "
-                       f"incoming={_i.dataType.simpleString()}")
-                elif _e.nullable != _i.nullable:
-                    _P(f"  NULLABLE DIFF {_n}: existing={_e.nullable} incoming={_i.nullable}")
-                elif _e.metadata != _i.metadata:
-                    _P(f"  METADATA DIFF {_n}: existing={_e.metadata} incoming={_i.metadata}")
-    except Exception as _e:
-        _P(f"diagnostic error (ignored): {_e}")
-    # --- END TEMP DIAGNOSTIC ---
-
     t0 = _time.perf_counter()
-    try:  # TEMP DIAGNOSTIC
-        if _is_databricks():
-            (
-                df.write.format("delta")
-                .mode("append")
-                .option("mergeSchema", "true")
-                .saveAsTable(full_table_name)
-            )
-        else:
-            # Local mode: write to path, then register as table.
-            path = _get_table_location(full_table_name)
-            (
-                df.write.format("delta")
-                .mode("append")
-                .option("mergeSchema", "true")
-                .save(path)
-            )
-            spark = get_spark()
-            try:
-                spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
-            except Exception:
-                pass
-            spark.sql(
-                f"CREATE TABLE IF NOT EXISTS {full_table_name} "
-                f"USING DELTA LOCATION '{path}'"
-            )
-    except Exception:  # TEMP DIAGNOSTIC
-        import traceback  # TEMP DIAGNOSTIC
-        print(f"[DELTA-DIAG] WRITE FAILED: {full_table_name}", flush=True)  # TEMP DIAGNOSTIC
-        print("[DELTA-DIAG] traceback:\n" + traceback.format_exc(), flush=True)  # TEMP DIAGNOSTIC
-        raise  # TEMP DIAGNOSTIC
+    if _is_databricks():
+        (
+            df.write.format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .saveAsTable(full_table_name)
+        )
+    else:
+        # Local mode: write to path, then register as table.
+        path = _get_table_location(full_table_name)
+        (
+            df.write.format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .save(path)
+        )
+        spark = get_spark()
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+        except Exception:
+            pass
+        spark.sql(
+            f"CREATE TABLE IF NOT EXISTS {full_table_name} "
+            f"USING DELTA LOCATION '{path}'"
+        )
     elapsed = _time.perf_counter() - t0
     _write_timings.record(full_table_name, "append", elapsed)
 
@@ -555,8 +491,9 @@ def validate_columns_exist(cfg: ReconcileConfig) -> None:
     Args:
         cfg: Active reconciliation configuration.
     """
-    left_cols = set(get_spark().table(cfg.left_table_name).columns)
+    left_schema = get_spark().table(cfg.left_table_name).schema
     right_cols = set(get_spark().table(cfg.right_table_name).columns)
+    left_cols = {f.name for f in left_schema.fields}
     strict_required_cols = set(cfg.key_cols) | set(cfg.critical_cols)
     missing_left = sorted(strict_required_cols - left_cols)
     missing_right = sorted(strict_required_cols - right_cols)
@@ -568,6 +505,11 @@ def validate_columns_exist(cfg: ReconcileConfig) -> None:
         raise ValueError(
             f"Missing required key/critical columns from right table: {missing_right[:50]}"
         )
+
+    # Reject unsupported batching-column types before any reconciliation work.
+    assert_supported_batch_key_type(
+        left_schema[cfg.qtr_col].dataType, cfg.qtr_col
+    )
 
 
 def resolve_all_compare_cols(cfg: ReconcileConfig) -> list[str]:
@@ -676,6 +618,133 @@ def normalize_for_hash(
         return F.coalesce(F.date_format(col_expr, "yyyy-MM-dd"), sentinel)
 
     return F.coalesce(col_expr.cast("string"), sentinel)
+
+
+# ---------------------------------------------------------------------------
+# Canonical batch key (invariant persistent-artifact schema)
+# ---------------------------------------------------------------------------
+#
+# Shared artifact tables (quarter_checksums, row_status_counts,
+# column_summary_by_quarter) are append-mode and shared across runs.  Writing
+# the batching dimension under its dataset-specific name/type (``cfg.qtr_col``)
+# makes their schema vary per run and breaks Delta schema merge.  We persist the
+# batching value under a single invariant column ``batch_key`` of type STRING.
+#
+# CANONICAL CONTRACT (must be produced identically by the Spark expression
+# ``batch_key_col``, the driver-side ``batch_key_value``, and the Polars engine):
+#
+#   NULL       -> NULL
+#   string     -> value unchanged
+#   integral   -> base-10 string, no separators   (byte/short/int/long)
+#   date       -> "yyyy-MM-dd"                     (ISO-8601 date)
+#   timestamp  -> "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"   (ISO-8601, microseconds)
+#
+# SUPPORTED batching-column types are exactly those five.  Timestamps are
+# formatted by their wall-clock components (Spark session timezone / naive
+# Polars datetime); a pure ``date`` column is recommended for period batching.
+#
+# INTENTIONALLY UNSUPPORTED: float, double, decimal, boolean, and any other
+# type.  These are not meaningful period/partition keys and their string
+# representations are not portable across Spark, Python, and Polars (float
+# repr, boolean casing).
+#
+# ENFORCEMENT lives upstream in ``validate_columns_exist`` (Spark) and
+# ``PolarsEngine.validate_tables`` (Polars), which reject unsupported
+# ``cfg.qtr_col`` types at setup — before any reconciliation work — with a
+# clear, column- and type-specific message.  The ``batch_key_*`` helpers below
+# assume validated input and only produce the canonical representation; their
+# terse fallthrough guard exists solely to surface a programming error should
+# validation ever be bypassed (it is NOT the user-facing validation policy).
+
+BATCH_KEY_COL = "batch_key"
+
+_BATCH_KEY_TS_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+_BATCH_KEY_SUPPORTED_DESC = (
+    "string, integral (byte/short/int/long), date, or timestamp"
+)
+
+
+def batch_key_unsupported_error(col_name: str, detected: str) -> ValueError:
+    """Build the canonical user-facing error for an unsupported batch key type.
+
+    Used by the upstream validators (Spark ``validate_columns_exist`` and
+    ``PolarsEngine.validate_tables``) so both engines emit identical wording.
+    """
+    return ValueError(
+        f"Batching column '{col_name}' has unsupported type '{detected}' for "
+        f"batch_key. cfg.qtr_col must be one of: {_BATCH_KEY_SUPPORTED_DESC}. "
+        f"float/double/decimal/boolean are not supported as batch keys."
+    )
+
+
+def assert_supported_batch_key_type(data_type: "T.DataType", col_name: str) -> None:
+    """Validate that a Spark ``cfg.qtr_col`` DataType is a supported batch key.
+
+    Raises :func:`batch_key_unsupported_error` if not.  Call this at setup
+    (see :func:`validate_columns_exist`) so unsupported configurations fail
+    before any expensive reconciliation begins.
+    """
+    from pyspark.sql import types as T
+
+    supported = (
+        T.StringType,
+        T.ByteType,
+        T.ShortType,
+        T.IntegerType,
+        T.LongType,
+        T.DateType,
+        T.TimestampType,
+    )
+    if not isinstance(data_type, supported):
+        raise batch_key_unsupported_error(col_name, data_type.simpleString())
+
+
+def batch_key_col(col_expr: "F.Column", data_type: "T.DataType") -> "F.Column":
+    """Format a validated batching-dimension Spark Column as the canonical string.
+
+    Pure formatter: assumes ``data_type`` was already accepted by
+    :func:`assert_supported_batch_key_type` upstream.  NULLs are preserved.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
+
+    if isinstance(data_type, T.TimestampType):
+        return F.date_format(col_expr, _BATCH_KEY_TS_FORMAT)
+    if isinstance(data_type, T.DateType):
+        return F.date_format(col_expr, "yyyy-MM-dd")
+    if isinstance(
+        data_type, (T.StringType, T.ByteType, T.ShortType, T.IntegerType, T.LongType)
+    ):
+        return col_expr.cast("string")
+    # Internal invariant — should be prevented by upstream validation.
+    raise ValueError(f"batch_key_col received unvalidated type: {data_type}")
+
+
+def batch_key_value(value: Any) -> "str | None":
+    """Driver-side equivalent of :func:`batch_key_col` for building row tuples.
+
+    Pure formatter producing output identical to :func:`batch_key_col` for the
+    same underlying value.  Assumes the batching column type was validated
+    upstream; NULLs are preserved.
+    """
+    import datetime
+
+    if value is None:
+        return None
+    # datetime is a subclass of date — check it first.
+    if isinstance(value, datetime.datetime):
+        return value.strftime("%Y-%m-%dT%H:%M:%S.%f")
+    if isinstance(value, datetime.date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        return value
+    # bool is a subclass of int — exclude it from the integral branch.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    # Internal invariant — should be prevented by upstream validation.
+    raise ValueError(
+        f"batch_key_value received unvalidated type: {type(value).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
